@@ -140,6 +140,21 @@ json::Value Convert(const pb::Message& m) {
         const auto* raw = field("raw") ? field("raw") : field("Raw");
         return raw ? RawJson(r->GetString(m, raw)) : json::Value();
     }
+    // The schema unions of apiextensions are one JSON value each: a schema
+    // or a list of them, a schema or a bool, a schema or a list of names.
+    static const std::string kExt = "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.";
+    if (name.starts_with(kExt)) {
+        const auto type = name.substr(name.rfind('.') + 1);
+        if (type == "JSON") return RawJson(r->GetString(m, field("raw")));
+        if (type == "JSONSchemaPropsOrArray" || type == "JSONSchemaPropsOrBool" || type == "JSONSchemaPropsOrStringArray") {
+            if (r->HasField(m, field("schema"))) return Convert(r->GetMessage(m, field("schema")));
+            if (type == "JSONSchemaPropsOrBool") return json::ValueBuilder(r->GetBool(m, field("allows"))).ExtractValue();
+            const auto* list = field(type == "JSONSchemaPropsOrArray" ? "jSONSchemas" : "property");
+            json::ValueBuilder out(json::Type::kArray);
+            for (int i = 0; i < r->FieldSize(m, list); ++i) out.PushBack(Scalar(m, r, list, i));
+            return out.ExtractValue();
+        }
+    }
 
     json::ValueBuilder out(json::Type::kObject);
     std::vector<const pb::FieldDescriptor*> fields;
@@ -195,6 +210,7 @@ std::vector<std::string> Candidates(const std::string& api_version, const std::s
         "k8s.io.apimachinery.pkg.apis.meta." + version + "." + kind,
         "k8s.io.apimachinery.pkg.apis.meta.v1." + kind,
         "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions." + version + "." + kind,
+        "k8s.io.kube_aggregator.pkg.apis." + pkg + "." + version + "." + kind,
     };
 }
 

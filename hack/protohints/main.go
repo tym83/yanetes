@@ -14,7 +14,11 @@
 //     go run ./hack/protohints <proto-dir> \
 //     $(go list -m -f '{{.Dir}}' k8s.io/api)=k8s.io.api \
 //     $(go list -m -f '{{.Dir}}' k8s.io/apimachinery)=k8s.io.apimachinery \
-//     $(go list -m -f '{{.Dir}}' k8s.io/apiextensions-apiserver)=k8s.io.apiextensions_apiserver
+//     $(go list -m -f '{{.Dir}}' k8s.io/apiextensions-apiserver)=k8s.io.apiextensions_apiserver \
+//     $(go list -m -f '{{.Dir}}' k8s.io/kube-aggregator)=k8s.io.kube_aggregator
+//
+// The staging directories of a Kubernetes checkout serve as well, for
+// modules this one does not depend on.
 package main
 
 import (
