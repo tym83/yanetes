@@ -419,7 +419,27 @@ std::vector<Column> Columns(const Resource& r) {
 
 }  // namespace
 
+std::string SelectorString(const Value& selector) {
+    if (!selector.IsObject()) return "";
+    if (selector.HasMember("matchLabels") || selector.HasMember("matchExpressions")) {
+        auto s = LabelSelector(selector);
+        return s == "<none>" ? "" : s;
+    }
+    auto s = Selector(selector);
+    return s == "<none>" ? "" : s;
+}
+
 bool Wanted(const std::string& accept) { return accept.find("as=Table") != std::string::npos; }
+
+bool MetadataWanted(const std::string& accept) { return accept.find("as=PartialObjectMetadata") != std::string::npos; }
+
+Value Metadata(const Value& object) {
+    ValueBuilder b(json::Type::kObject);
+    b["kind"] = "PartialObjectMetadata";
+    b["apiVersion"] = "meta.k8s.io/v1";
+    b["metadata"] = object["metadata"];
+    return b.ExtractValue();
+}
 
 std::string HumanDuration(std::int64_t s) {
     if (s < -1) return "<invalid>";
@@ -478,11 +498,7 @@ Value Make(
         if (include_object == "Object") {
             row["object"] = item;
         } else if (include_object != "None") {
-            ValueBuilder meta(json::Type::kObject);
-            meta["kind"] = "PartialObjectMetadata";
-            meta["apiVersion"] = "meta.k8s.io/v1";
-            meta["metadata"] = item["metadata"];
-            row["object"] = meta;
+            row["object"] = Metadata(item);
         }
         rows.PushBack(row.ExtractValue());
     }

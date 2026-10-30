@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <userver/formats/json/value.hpp>
 
@@ -24,9 +25,19 @@ public:
         return *this;
     }
 
+    // A machine-readable cause, as details.causes carries it.
+    ApiError& Cause(std::string type, std::string message, std::string field = "") {
+        causes_.push_back({std::move(type), std::move(message), std::move(field)});
+        return *this;
+    }
+
     userver::formats::json::Value ToStatus() const;
 
 private:
+    struct CauseEntry {
+        std::string type, message, field;
+    };
+    std::vector<CauseEntry> causes_;
     int code_;
     std::string reason_;
     std::string kind_, group_, name_;

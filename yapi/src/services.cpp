@@ -26,12 +26,12 @@ using json::ValueBuilder;
 namespace {
 
 // Not served: node ports are the server's own bookkeeping.
-const Resource kNodePorts{"yapi.internal", "v1", "nodeports", "nodeport", "NodePort", false, false};
+const Resource kNodePorts{"yapi.internal", "v1", "nodeports", "nodeport", "NodePort", false, false, {}, {}, {}};
 
 constexpr int kAttempts = 64;
 
-const Resource& Find(const std::string& group, const std::string& plural) {
-    return *Registry::Builtin().Find(group, "v1", plural);
+const Resource& Find(std::string_view group, std::string_view plural) {
+    return *Registry::Builtin().Find(std::string(group), "v1", std::string(plural));
 }
 
 std::string IpString(std::uint32_t ip) {

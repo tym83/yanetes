@@ -44,6 +44,8 @@ private:
     std::string Handle(const userver::server::http::HttpRequest& request) const;
     // Reviews and the like: answered, not stored.
     std::string Review(const Resource& r, const userver::server::http::HttpRequest& request, const User& user) const;
+    void Bind(const std::string& ns, const std::string& name, const std::string& node) const;
+    void Evict(const std::string& ns, const std::string& name, const userver::formats::json::Value& options) const;
     std::string TokenRequest(const std::string& ns, const std::string& name, const userver::server::http::HttpRequest& request) const;
 
     Store& store_;

@@ -1,12 +1,14 @@
 #include <api.hpp>
 
 #include <fstream>
+#include <tuple>
 #include <sstream>
 
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/crypto/base64.hpp>
 #include <userver/engine/deadline.hpp>
+#include <userver/engine/task/cancel.hpp>
 #include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/serialize/common_containers.hpp>
@@ -41,7 +43,7 @@ namespace {
 
 constexpr std::string_view kVersion = "v1.37.1+ya";
 
-const Resource kNamespaces{"", "v1", "namespaces", "namespace", "Namespace", false, true};
+const Resource& kNamespaces = *Registry::Builtin().Find("", "v1", "namespaces");
 
 std::vector<std::string> Split(const std::string& path) {
     std::vector<std::string> out;
@@ -65,6 +67,28 @@ std::vector<std::string> Verbs(const Resource& r) {
 }
 
 bool IsServiceAccount(const Resource& r) { return r.group.empty() && r.plural == "serviceaccounts"; }
+bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
+bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
+bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
+bool HasScale(const Resource& r) {
+    return (r.group == "apps" && (r.plural == "deployments" || r.plural == "replicasets" || r.plural == "statefulsets")) ||
+           (r.group.empty() && r.plural == "replicationcontrollers");
+}
+
+// The autoscaling/v1 Scale of an object with replicas.
+Value ScaleOf(const Value& object) {
+    ValueBuilder b(json::Type::kObject);
+    b["kind"] = "Scale";
+    b["apiVersion"] = "autoscaling/v1";
+    for (const char* key : {"name", "namespace", "uid", "resourceVersion", "creationTimestamp"}) {
+        if (object["metadata"].HasMember(key)) b["metadata"][key] = object["metadata"][key];
+    }
+    b["spec"]["replicas"] = object["spec"]["replicas"].As<std::int64_t>(0);
+    b["status"]["replicas"] = object["status"]["replicas"].As<std::int64_t>(0);
+    auto selector = tables::SelectorString(object["spec"]["selector"]);
+    if (!selector.empty()) b["status"]["selector"] = selector;
+    return b.ExtractValue();
+}
 
 Value ResourceList(const Registry& reg, const std::string& gv) {
     ValueBuilder b(json::Type::kObject);
@@ -86,6 +110,33 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
         std::vector<std::string> subs;
         if (r.has_status) subs.push_back("status");
         if (r.group.empty() && r.plural == "namespaces") subs.push_back("finalize");
+        if (HasScale(r)) {
+            ValueBuilder se(json::Type::kObject);
+            se["name"] = r.plural + "/scale";
+            se["singularName"] = "";
+            se["namespaced"] = true;
+            se["group"] = "autoscaling";
+            se["version"] = "v1";
+            se["kind"] = "Scale";
+            se["verbs"] = std::vector<std::string>{"get", "patch", "update"};
+            list.PushBack(se.ExtractValue());
+        }
+        if (IsPod(r)) {
+            for (const auto& [sub, kind, sgroup] : std::vector<std::tuple<std::string, std::string, std::string>>{
+                     {"binding", "Binding", ""}, {"eviction", "Eviction", "policy"}}) {
+                ValueBuilder se(json::Type::kObject);
+                se["name"] = "pods/" + sub;
+                se["singularName"] = "";
+                se["namespaced"] = true;
+                if (!sgroup.empty()) {
+                    se["group"] = sgroup;
+                    se["version"] = "v1";
+                }
+                se["kind"] = kind;
+                se["verbs"] = std::vector<std::string>{"create"};
+                list.PushBack(se.ExtractValue());
+            }
+        }
         if (IsServiceAccount(r)) {
             ValueBuilder se(json::Type::kObject);
             se["name"] = "serviceaccounts/token";
@@ -207,9 +258,6 @@ std::string Propagation(const http::HttpRequest& req, const Value& options) {
     return "";
 }
 
-bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
-bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
-bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
 
 // Whether an object asked to go away may go now.
 bool Releasable(const Resource& r, const Value& object) {
@@ -391,13 +439,14 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     if (rest.size() >= 2) t.name = rest[1];
     if (rest.size() == 3) t.sub = rest[2];
     if (!t.sub.empty() && !(t.sub == "status" && r.has_status) && !(t.sub == "finalize" && IsNamespace(r)) &&
-        !(t.sub == "token" && IsServiceAccount(r))) {
+        !(t.sub == "token" && IsServiceAccount(r)) && !(t.sub == "scale" && HasScale(r)) && !((t.sub == "binding" || t.sub == "eviction") && IsPod(r))) {
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
     }
     if (!r.namespaced && !t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
 
     const bool dry_run = Arg(request, "dryRun") == "All";
     const bool table = tables::Wanted(request.GetHeader("Accept"));
+    const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
     const auto include_object = Arg(request, "includeObject");
 
     if (r.CreateOnly()) {
@@ -406,6 +455,17 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         }
         response.SetStatus(http::HttpStatus::kCreated);
         return Review(r, request, *user);
+    }
+    if (t.sub == "binding" || t.sub == "eviction") {
+        if (method != http::HttpMethod::kPost) throw MethodNotAllowed("the server does not allow this method on the requested resource");
+        auto body = ParseBody(request.RequestBody());
+        if (t.sub == "binding") {
+            Bind(t.ns, t.name, body["target"]["name"].As<std::string>(""));
+        } else {
+            Evict(t.ns, t.name, body["deleteOptions"]);
+        }
+        response.SetStatus(http::HttpStatus::kCreated);
+        return json::ToString(SuccessStatus());
     }
     if (t.sub == "token") {
         if (method != http::HttpMethod::kPost) throw MethodNotAllowed("the server does not allow this method on the requested resource");
@@ -421,44 +481,32 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             std::size_t limit = request.HasArg("limit") ? std::stoull(Arg(request, "limit")) : 0;
             auto [after_ns, after_name] = DecodeContinue(Arg(request, "continue"));
             auto ns = t.ns.empty() && r.namespaced ? fields.Pinned("metadata.namespace") : t.ns;
+            auto render = [&](const std::vector<Value>& items, const std::string& rv, const std::string& cont) {
+                if (table) return json::ToString(tables::Make(r, items, true, include_object, rv, cont));
+                ValueBuilder list(json::Type::kObject);
+                list["kind"] = metadata ? "PartialObjectMetadataList" : r.kind + "List";
+                list["apiVersion"] = metadata ? "meta.k8s.io/v1" : r.GroupVersion();
+                list["metadata"]["resourceVersion"] = rv;
+                if (!cont.empty()) list["metadata"]["continue"] = cont;
+                ValueBuilder out(json::Type::kArray);
+                for (const auto& item : items) out.PushBack(metadata ? tables::Metadata(item) : item);
+                list["items"] = out;
+                return json::ToString(list.ExtractValue());
+            };
+            std::vector<Value> found;
             if (!r.namespaced && !fields.Pinned("metadata.name").empty() && limit == 0) {
                 // A list of one by name, as the kubelet asks for its node.
                 auto one = store_.Get(r, "", fields.Pinned("metadata.name"));
-                auto rv = std::to_string(store_.Revision(r));
-                std::vector<Value> found;
                 if (one && labels.Matches((*one)["metadata"]["labels"])) found.push_back(*one);
-                if (table) return json::ToString(tables::Make(r, found, true, include_object, rv, ""));
-                ValueBuilder list(json::Type::kObject);
-                list["kind"] = r.kind + "List";
-                list["apiVersion"] = r.GroupVersion();
-                list["metadata"]["resourceVersion"] = rv;
-                list["items"] = found;
-                return json::ToString(list.ExtractValue());
+                return render(found, std::to_string(store_.Revision(r)), "");
             }
             auto page = store_.List(r, ns, limit, after_ns, after_name);
-            if (table) {
-                std::vector<Value> found;
-                for (const auto& item : page.items) {
-                    if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) found.push_back(item);
-                }
-                return json::ToString(tables::Make(
-                    r, found, true, include_object, std::to_string(page.rv),
-                    page.last_name.empty() ? "" : EncodeContinue(page.last_ns, page.last_name)
-                ));
+            for (auto& item : page.items) {
+                if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) found.push_back(std::move(item));
             }
-            ValueBuilder list(json::Type::kObject);
-            list["kind"] = r.kind + "List";
-            list["apiVersion"] = r.GroupVersion();
-            list["metadata"]["resourceVersion"] = std::to_string(page.rv);
-            if (!page.last_name.empty()) {
-                list["metadata"]["continue"] = EncodeContinue(page.last_ns, page.last_name);
-            }
-            ValueBuilder items(json::Type::kArray);
-            for (const auto& item : page.items) {
-                if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) items.PushBack(item);
-            }
-            list["items"] = items;
-            return json::ToString(list.ExtractValue());
+            return render(
+                found, std::to_string(page.rv), page.last_name.empty() ? "" : EncodeContinue(page.last_ns, page.last_name)
+            );
         }
         if (method == http::HttpMethod::kPost) {
             auto incoming = ParseBody(request.RequestBody());
@@ -469,10 +517,8 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 auto ns = store_.Get(kNamespaces, "", t.ns);
                 if (!ns) throw NotFound("namespaces", "", t.ns);
                 if (objects::Deleting(*ns)) {
-                    throw ApiError(
-                        403, "Forbidden",
-                        "unable to create new content in namespace " + t.ns + " because it is being terminated"
-                    );
+                    const auto why = "unable to create new content in namespace " + t.ns + " because it is being terminated";
+                    throw ApiError(403, "Forbidden", why).About(r.plural, r.group, name).Cause("NamespaceTerminating", why, "metadata.namespace");
                 }
             }
             if (dry_run) {
@@ -523,11 +569,41 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         throw MethodNotAllowed("the server does not allow this method on the requested resource");
     }
 
+    if (t.sub == "scale") {
+        if (method == http::HttpMethod::kGet) {
+            auto obj = store_.Get(r, t.ns, t.name);
+            if (!obj) throw NotFound(r.plural, r.group, t.name);
+            return json::ToString(ScaleOf(*obj));
+        }
+        if (method != http::HttpMethod::kPut && method != http::HttpMethod::kPatch) {
+            throw MethodNotAllowed("the server does not allow this method on the requested resource");
+        }
+        const auto body = request.RequestBody();
+        const auto content_type = request.GetHeader(userver::http::headers::kContentType);
+        auto decide = [&](const std::optional<Value>& current) -> Decision {
+            if (!current) throw NotFound(r.plural, r.group, t.name);
+            auto scale = method == http::HttpMethod::kPatch ? patch::Apply(content_type, ScaleOf(*current), body) : ParseBody(body);
+            auto rv = scale["metadata"]["resourceVersion"].As<std::string>("");
+            if (method == http::HttpMethod::kPut && !rv.empty()) CheckVersion(r, *current, scale);
+            auto replicas = scale["spec"]["replicas"].As<std::int64_t>(0);
+            if (replicas < 0) throw Invalid("Scale", "autoscaling", t.name, "spec.replicas: Invalid value: " + std::to_string(replicas) + ": must be greater than or equal to 0");
+            if ((*current)["spec"]["replicas"].As<std::int64_t>(-1) == replicas) return Decision::Keep();
+            ValueBuilder b(*current);
+            b["spec"]["replicas"] = replicas;
+            b["metadata"]["generation"] = (*current)["metadata"]["generation"].As<std::int64_t>(0) + 1;
+            return Decision::Put(b.ExtractValue());
+        };
+        if (dry_run) return json::ToString(ScaleOf(decide(store_.Get(r, t.ns, t.name)).object));
+        auto d = store_.Write(r, t.ns, t.name, decide);
+        return json::ToString(ScaleOf(d.object));
+    }
+
     // Single objects.
     if (method == http::HttpMethod::kGet) {
         auto obj = store_.Get(r, t.ns, t.name);
         if (!obj) throw NotFound(r.plural, r.group, t.name);
         if (table && t.sub.empty()) return json::ToString(tables::Make(r, {*obj}, true, include_object, "", ""));
+        if (metadata && t.sub.empty()) return json::ToString(tables::Metadata(*obj));
         return json::ToString(*obj);
     }
 
@@ -648,6 +724,50 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     }
 
     throw MethodNotAllowed("the server does not allow this method on the requested resource");
+}
+
+void Api::Bind(const std::string& ns, const std::string& name, const std::string& node) const {
+    if (node.empty()) throw Invalid("Binding", "", name, "target.name: Required value");
+    const auto& pods = *registry_.Find("", "v1", "pods");
+    store_.Write(pods, ns, name, [&](const std::optional<Value>& current) {
+        if (!current) throw NotFound("pods", "", name);
+        if (objects::Deleting(*current)) {
+            throw Conflict("pods", "", name, "pod " + name + " is being deleted, cannot be assigned to a host");
+        }
+        auto assigned = (*current)["spec"]["nodeName"].As<std::string>("");
+        if (!assigned.empty()) throw Conflict("pods", "", name, "pod " + name + " is already assigned to node \"" + assigned + "\"");
+        ValueBuilder b(*current);
+        b["spec"]["nodeName"] = node;
+        ValueBuilder conditions(json::Type::kArray);
+        for (const auto& c : objects::Items((*current)["status"]["conditions"])) {
+            if (c["type"].As<std::string>("") != "PodScheduled") conditions.PushBack(c);
+        }
+        ValueBuilder scheduled(json::Type::kObject);
+        scheduled["type"] = "PodScheduled";
+        scheduled["status"] = "True";
+        scheduled["lastProbeTime"] = Value();
+        scheduled["lastTransitionTime"] = objects::Now();
+        conditions.PushBack(scheduled.ExtractValue());
+        b["status"]["conditions"] = conditions;
+        return Decision::Put(b.ExtractValue());
+    });
+}
+
+void Api::Evict(const std::string& ns, const std::string& name, const Value& options) const {
+    const auto& pods = *registry_.Find("", "v1", "pods");
+    store_.Write(pods, ns, name, [&](const std::optional<Value>& current) {
+        if (!current) throw NotFound("pods", "", name);
+        if (objects::Deleting(*current)) return Decision::Keep();
+        ValueBuilder b(*current);
+        std::int64_t grace = options.IsObject() && options.HasMember("gracePeriodSeconds") && !options["gracePeriodSeconds"].IsNull()
+                                 ? options["gracePeriodSeconds"].As<std::int64_t>()
+                                 : (*current)["spec"]["terminationGracePeriodSeconds"].As<std::int64_t>(30);
+        if ((*current)["spec"]["nodeName"].As<std::string>("").empty()) grace = 0;
+        b["metadata"]["deletionTimestamp"] = objects::Now();
+        b["metadata"]["deletionGracePeriodSeconds"] = grace;
+        auto next = b.ExtractValue();
+        return Releasable(pods, next) ? Decision::Remove(next) : Decision::Put(next);
+    });
 }
 
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
@@ -824,9 +944,16 @@ void Api::HandleStreamRequest(
         stream.SetStatusCode(200);
         stream.SetEndOfHeaders();
         const bool table = tables::Wanted(request.GetHeader("Accept"));
+        const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
         const auto include_object = Arg(request, "includeObject");
         bool columns_sent = false;
         auto send = [&](const Value& event) {
+            if (metadata && event["type"].As<std::string>("") != "ERROR") {
+                ValueBuilder b(event);
+                b["object"] = tables::Metadata(event["object"]);
+                stream.PushBodyChunk(json::ToString(b.ExtractValue()) + "\n", deadline);
+                return;
+            }
             if (table && event["type"].As<std::string>("") != "ERROR" && event["type"].As<std::string>("") != "BOOKMARK") {
                 ValueBuilder b(event);
                 b["object"] = tables::Make(r, {event["object"]}, !columns_sent, include_object, "", "");
@@ -852,7 +979,10 @@ void Api::HandleStreamRequest(
         last = std::max(last, sub->ReplayUntil());
         if (Flag(request, "sendInitialEvents") && bookmarks) send(Bookmark(r, std::max(after, last), true));
         auto last_bookmark = std::chrono::steady_clock::now();
-        while (!deadline.IsReached()) {
+        // A client that hangs up cancels the task, and a cancelled task's
+        // waits return at once: without this check the loop spins until
+        // the deadline.
+        while (!deadline.IsReached() && !userver::engine::current_task::ShouldCancel()) {
             auto e = sub->Next(std::chrono::seconds(1));
             if (sub->Dropped()) {
                 send(Event("ERROR", Gone("the watcher fell behind; list again").ToStatus()));

@@ -23,11 +23,22 @@ json::Value ApiError::ToStatus() const {
     b["message"] = std::string(what());
     b["reason"] = reason_;
     b["code"] = code_;
-    if (!name_.empty() || !kind_.empty()) {
+    if (!name_.empty() || !kind_.empty() || !causes_.empty()) {
         json::ValueBuilder d(json::Type::kObject);
         if (!name_.empty()) d["name"] = name_;
         if (!group_.empty()) d["group"] = group_;
         if (!kind_.empty()) d["kind"] = kind_;
+        if (!causes_.empty()) {
+            json::ValueBuilder causes(json::Type::kArray);
+            for (const auto& c : causes_) {
+                json::ValueBuilder cb(json::Type::kObject);
+                cb["reason"] = c.type;
+                cb["message"] = c.message;
+                if (!c.field.empty()) cb["field"] = c.field;
+                causes.PushBack(cb.ExtractValue());
+            }
+            d["causes"] = causes;
+        }
         b["details"] = d;
     }
     return b.ExtractValue();
