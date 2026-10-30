@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"maps"
+	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"time"
@@ -168,7 +170,10 @@ func (d *Deployments) sync(ctx context.Context, key string) error {
 	}
 	sort.Slice(old, func(i, j int) bool { return old[i].CreationTimestamp.Before(&old[j].CreationTimestamp) })
 
-	if dep.Spec.Paused {
+	if dep.Spec.Paused || scalingEvent(dep, newRS, old) {
+		if err := d.scaleProportionally(ctx, dep, newRS, old); err != nil {
+			return err
+		}
 		return d.status(ctx, dep, newRS, old, "")
 	}
 	recreate := dep.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType
@@ -239,6 +244,130 @@ func (d *Deployments) scale(ctx context.Context, dep *appsv1.Deployment, rs *app
 	rs.Annotations[annDesiredReplicas] = desired
 	rs.Annotations[annMaxReplicas] = maxR
 	return d.client.AppsV1().ReplicaSets(rs.Namespace).Update(ctx, rs, metav1.UpdateOptions{})
+}
+
+// scalingEvent says whether the deployment's size changed since its active
+// sets were last scaled: they remember the size in an annotation.
+func scalingEvent(dep *appsv1.Deployment, newRS *appsv1.ReplicaSet, old []*appsv1.ReplicaSet) bool {
+	for _, rs := range activeSets(newRS, old) {
+		if desired, ok := rs.Annotations[annDesiredReplicas]; ok && desired != strconv.Itoa(int(ptr.Deref(dep.Spec.Replicas, 1))) {
+			return true
+		}
+	}
+	return false
+}
+
+func activeSets(newRS *appsv1.ReplicaSet, old []*appsv1.ReplicaSet) []*appsv1.ReplicaSet {
+	var out []*appsv1.ReplicaSet
+	for _, rs := range append(slices.Clone(old), newRS) {
+		if rs != nil && replicas(rs) > 0 {
+			out = append(out, rs)
+		}
+	}
+	return out
+}
+
+// scaleProportionally spreads a change of the deployment's size over its
+// sets in proportion to their sizes, as upstream's controller does, so a
+// rollout in progress keeps its shape.
+func (d *Deployments) scaleProportionally(ctx context.Context, dep *appsv1.Deployment, newRS *appsv1.ReplicaSet, old []*appsv1.ReplicaSet) error {
+	want := ptr.Deref(dep.Spec.Replicas, 1)
+	sets := activeSets(newRS, old)
+	// One set with pods, or none: it takes the whole size.
+	if len(sets) <= 1 {
+		target := newRS
+		if len(sets) == 1 {
+			target = sets[0]
+		} else if target == nil && len(old) > 0 {
+			target = old[len(old)-1]
+		}
+		if target == nil || replicas(target) == want {
+			return nil
+		}
+		_, err := d.scale(ctx, dep, target, want, true)
+		return err
+	}
+	if newRS != nil && replicas(newRS) == want && newRS.Annotations[annDesiredReplicas] == strconv.Itoa(int(want)) &&
+		newRS.Status.AvailableReplicas == want {
+		for _, rs := range activeSets(nil, old) {
+			if _, err := d.scale(ctx, dep, rs, 0, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if dep.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		return nil
+	}
+	surge, _ := surgeAndUnavailable(dep)
+	allowed := int32(0)
+	if want > 0 {
+		allowed = want + surge
+	}
+	var total int32
+	for _, rs := range sets {
+		total += replicas(rs)
+	}
+	toAdd := allowed - total
+	// Bigger sets first; among equals, newer ones get more and lose less.
+	sort.SliceStable(sets, func(i, j int) bool {
+		if replicas(sets[i]) != replicas(sets[j]) {
+			return replicas(sets[i]) > replicas(sets[j])
+		}
+		if toAdd > 0 {
+			return sets[j].CreationTimestamp.Before(&sets[i].CreationTimestamp)
+		}
+		return sets[i].CreationTimestamp.Before(&sets[j].CreationTimestamp)
+	})
+	sizes := make([]int32, len(sets))
+	var added int32
+	for i, rs := range sets {
+		sizes[i] = replicas(rs)
+		if toAdd != 0 {
+			p := proportion(rs, dep, toAdd, added)
+			sizes[i] += p
+			added += p
+		}
+	}
+	// What rounding left over goes to the biggest set.
+	if toAdd != 0 {
+		sizes[0] = max(sizes[0]+toAdd-added, 0)
+	}
+	for i, rs := range sets {
+		if _, err := d.scale(ctx, dep, rs, sizes[i], true); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// proportion is a set's share of a change, from the size the deployment had
+// when the set was last scaled.
+func proportion(rs *appsv1.ReplicaSet, dep *appsv1.Deployment, toAdd, added int32) int32 {
+	if replicas(rs) == 0 || toAdd == 0 || toAdd == added {
+		return 0
+	}
+	want := ptr.Deref(dep.Spec.Replicas, 1)
+	var fraction int32
+	if want == 0 {
+		fraction = -replicas(rs)
+	} else {
+		surge, _ := surgeAndUnavailable(dep)
+		before, err := strconv.Atoi(rs.Annotations[annMaxReplicas])
+		if err != nil || before == 0 {
+			before = int(dep.Status.Replicas)
+		}
+		if before == 0 {
+			return 0
+		}
+		size := float64(replicas(rs)) * float64(want+surge) / float64(before)
+		fraction = int32(math.Round(size)) - replicas(rs)
+	}
+	left := toAdd - added
+	if toAdd > 0 {
+		return min(fraction, left)
+	}
+	return max(fraction, left)
 }
 
 // recreateOld scales every old set to zero and says whether their pods are gone.
