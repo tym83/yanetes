@@ -1,0 +1,15 @@
+# The stand lives in its own tenant of the workshop cluster: YDB wants AVX2
+# and a real disk, the C++ toolchain wants cores. Nothing heavy on a laptop.
+apiVersion: apps.cozystack.io/v1alpha1
+kind: Tenant
+metadata:
+  name: yandexnetes
+  namespace: tenant-root
+spec:
+  etcd: false
+  ingress: false
+  monitoring: false
+  seaweedfs: false
+  resourceQuotas:
+    cpu: "40"
+    memory: 80Gi

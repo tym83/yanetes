@@ -1,0 +1,54 @@
+# The builder: sources, caches and results on one persistent disk.
+#   cxx  userver toolchain; builds yapi
+#   go   Go, kubectl; builds the controllers and runs scenarios
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: work
+  namespace: tenant-yandexnetes
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: replicated
+  resources:
+    requests:
+      storage: 80Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: builder
+  namespace: tenant-yandexnetes
+  labels:
+    app: builder
+spec:
+  terminationGracePeriodSeconds: 5
+  containers:
+  - name: cxx
+    image: ghcr.io/userver-framework/ubuntu-24.04-userver:latest
+    command: [sh, -c, "mkdir -p /work/tmp && exec sleep infinity"]
+    workingDir: /work
+    env:
+    - {name: TMPDIR, value: /work/tmp}
+    - {name: CCACHE_DIR, value: /work/ccache}
+    resources:
+      requests: {cpu: "1", memory: 2Gi}
+      limits: {cpu: "16", memory: 32Gi}
+    volumeMounts:
+    - {name: work, mountPath: /work}
+  - name: go
+    image: golang:1.26-bookworm
+    command: [sh, -c, "mkdir -p /work/tmp && exec sleep infinity"]
+    workingDir: /work
+    env:
+    - {name: TMPDIR, value: /work/tmp}
+    - {name: GOPATH, value: /work/go}
+    - {name: GOCACHE, value: /work/gocache}
+    resources:
+      requests: {cpu: 200m, memory: 1Gi}
+      limits: {cpu: "8", memory: 16Gi}
+    volumeMounts:
+    - {name: work, mountPath: /work}
+  volumes:
+  - name: work
+    persistentVolumeClaim:
+      claimName: work

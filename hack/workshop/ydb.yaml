@@ -1,0 +1,54 @@
+# A single-node YDB: the cluster's storage instead of etcd.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ydb
+  namespace: tenant-yandexnetes
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: replicated
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ydb
+  namespace: tenant-yandexnetes
+  labels:
+    app: ydb
+spec:
+  hostname: ydb
+  terminationGracePeriodSeconds: 30
+  containers:
+  - name: ydb
+    image: ydbplatform/local-ydb:latest
+    env:
+    - {name: GRPC_PORT, value: "2136"}
+    - {name: MON_PORT, value: "8765"}
+    - {name: YDB_DEFAULT_LOG_LEVEL, value: NOTICE}
+    ports:
+    - {name: grpc, containerPort: 2136}
+    - {name: mon, containerPort: 8765}
+    resources:
+      requests: {cpu: "2", memory: 8Gi}
+      limits: {cpu: "8", memory: 16Gi}
+    volumeMounts:
+    - {name: data, mountPath: /ydb_data}
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: ydb
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ydb
+  namespace: tenant-yandexnetes
+spec:
+  selector:
+    app: ydb
+  ports:
+  - {name: grpc, port: 2136}
+  - {name: mon, port: 8765}
