@@ -64,6 +64,8 @@ func main() {
 		nanny.NewDeployments(client, factory),
 		nanny.NewEndpoints(client, factory),
 		ipam,
+		nanny.NewNodeLifecycle(client, factory),
+		nanny.NewPodGC(client, factory),
 		nanny.NewGC(meta, client.Discovery()),
 	}
 	factory.Start(ctx.Done())

@@ -37,7 +37,21 @@ public:
                 return current ? Decision::Keep() : Decision::Put(object);
             });
         }
-        LOG_INFO() << "yapi: bootstrap namespaces in place";
+        // The classes upstream creates for the cluster's own pods.
+        const auto* pcs = Registry::Builtin().Find("scheduling.k8s.io", "v1", "priorityclasses");
+        for (const auto& [name, value] : std::vector<std::pair<std::string, std::int64_t>>{
+                 {"system-node-critical", 2000001000}, {"system-cluster-critical", 2000000000}}) {
+            userver::formats::json::ValueBuilder b(userver::formats::json::Type::kObject);
+            b["metadata"]["name"] = name;
+            b["value"] = value;
+            b["description"] = "Used for system critical pods that must not be moved from their current node.";
+            b["preemptionPolicy"] = "PreemptLowerPriority";
+            auto object = objects::PrepareCreate(*pcs, b.ExtractValue(), "");
+            store.Write(*pcs, "", name, [&](const auto& current) {
+                return current ? Decision::Keep() : Decision::Put(object);
+            });
+        }
+        LOG_INFO() << "yapi: bootstrap namespaces and priority classes in place";
     }
 };
 

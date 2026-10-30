@@ -21,6 +21,7 @@
 #include <userver/utils/rand.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
 
+#include <admission.hpp>
 #include <auth.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
@@ -521,6 +522,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                     throw ApiError(403, "Forbidden", why).About(r.plural, r.group, name).Cause("NamespaceTerminating", why, "metadata.namespace");
                 }
             }
+            object = admission::Admit(store_, r, object);
             if (dry_run) {
                 if (store_.Get(r, t.ns, name)) throw AlreadyExists(r.plural, r.group, name);
                 response.SetStatus(http::HttpStatus::kCreated);

@@ -37,3 +37,17 @@ TEST(Patch, StrategicDirectives) {
     EXPECT_EQ(out["spec"]["containers"].GetSize(), 1u);
     EXPECT_EQ(out["spec"]["containers"][0]["name"].As<std::string>(), "x");
 }
+
+TEST(Patch, StrategicReplacesUntaggedLists) {
+    auto target = json::FromString(R"({"status":{"containerStatuses":[{"name":"c","state":{"waiting":{"reason":"ContainerCreating"}}}]}})");
+    auto patch = R"({"status":{"containerStatuses":[{"name":"c","state":{"running":{"startedAt":"t"}}}]}})";
+    auto out = yapi::patch::Apply("application/strategic-merge-patch+json", target, patch);
+    EXPECT_EQ(json::ToString(out["status"]["containerStatuses"][0]["state"]), R"({"running":{"startedAt":"t"}})");
+}
+
+TEST(Patch, StrategicNullRemovesNestedField) {
+    auto target = json::FromString(R"({"spec":{"containers":[{"name":"c","resources":{"limits":{"cpu":"1"}}}]}})");
+    auto patch = R"({"spec":{"containers":[{"name":"c","resources":{"limits":null}}]}})";
+    auto out = yapi::patch::Apply("application/strategic-merge-patch+json", target, patch);
+    EXPECT_EQ(json::ToString(out["spec"]["containers"][0]), R"({"name":"c","resources":{}})");
+}

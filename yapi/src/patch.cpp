@@ -15,7 +15,9 @@ namespace json = userver::formats::json;
 
 namespace {
 
-// Lists merged by a key, and the key. "ports" depends on what is in it.
+// Lists merged by a key, and the key, as the API types' patchMergeKey tags
+// say. Lists without a tag (containerStatuses, taints) are replaced whole.
+// "ports" depends on what is in it.
 std::string MergeKey(const std::string& field, const Value& list) {
     static const std::vector<std::pair<std::string_view, std::string_view>> kKeys = {
         {"containers", "name"},
@@ -27,17 +29,12 @@ std::string MergeKey(const std::string& field, const Value& list) {
         {"env", "name"},
         {"imagePullSecrets", "name"},
         {"conditions", "type"},
-        {"containerStatuses", "name"},
-        {"initContainerStatuses", "name"},
-        {"ephemeralContainerStatuses", "name"},
         {"addresses", "type"},
         {"podIPs", "ip"},
         {"hostIPs", "ip"},
         {"ownerReferences", "uid"},
-        {"taints", "key"},
         {"hostAliases", "ip"},
         {"resourceClaims", "name"},
-        {"volumesAttached", "name"},
         {"topologySpreadConstraints", "topologyKey"},
     };
     if (field == "ports") {

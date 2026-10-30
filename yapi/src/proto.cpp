@@ -3,6 +3,8 @@
 #include <atomic>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
+#include <unordered_set>
 
 #include <google/protobuf/compiler/importer.h>
 #include <google/protobuf/descriptor.h>
@@ -25,6 +27,11 @@ namespace pb = google::protobuf;
 namespace {
 
 std::atomic<const Decoder*> g_instance{nullptr};
+
+// *string fields of the API types, as message.field: protobuf writes a
+// *string set to "" just as it writes an empty string, and only for these
+// "" means something (storageClassName "" turns provisioning off).
+std::unordered_set<std::string> g_pointer_strings;
 
 class Errors final : public pb::compiler::MultiFileErrorCollector {
 public:
@@ -144,7 +151,10 @@ json::Value Convert(const pb::Message& m) {
             auto v = Scalar(m, r, f, -1);
             // Go writes every plain string field, JSON omits the empty ones:
             // an empty imagePullPolicy is not a policy.
-            if (v.IsString() && f->type() == pb::FieldDescriptor::TYPE_STRING && v.As<std::string>().empty()) continue;
+            if (v.IsString() && f->type() == pb::FieldDescriptor::TYPE_STRING && v.As<std::string>().empty() &&
+                !g_pointer_strings.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
+                continue;
+            }
             if (!v.IsNull() && !v.IsMissing()) out[std::string(f->name())] = v;
         }
     }
@@ -183,7 +193,12 @@ Decoder::Decoder(const std::string& proto_dir) : impl_(std::make_unique<Impl>())
         auto rel = std::filesystem::relative(entry.path(), proto_dir).string();
         if (impl_->importer.Import(rel)) ++loaded;
     }
-    LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir;
+    std::ifstream pointers(proto_dir + "/pointer-strings.txt");
+    for (std::string line; std::getline(pointers, line);) {
+        if (!line.empty()) g_pointer_strings.insert(line);
+    }
+    LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir << ", " << g_pointer_strings.size()
+               << " pointer string fields";
 }
 
 Decoder::~Decoder() = default;

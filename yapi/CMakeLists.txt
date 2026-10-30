@@ -23,6 +23,7 @@ add_library(yapi_objs OBJECT
     src/auth.cpp
     src/services.cpp
     src/tables.cpp
+    src/admission.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)
