@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/metadata/metadatainformer"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
 )
 
 // GC deletes what its owners left behind and carries out foreground and
@@ -344,6 +345,29 @@ func (g *GC) orphan(ctx context.Context, uid types.UID, n *gcNode) error {
 }
 
 func (g *GC) foreground(ctx context.Context, uid types.UID, n *gcNode) error {
+	// An object that waits for its own dependents stops blocking owners
+	// that wait for it, as upstream's collector does: otherwise a cycle of
+	// owners waits forever.
+	if len(g.dependentsOf(uid)) > 0 {
+		refs := slices.Clone(n.owners)
+		changed := false
+		for i, ref := range refs {
+			if ref.BlockOwnerDeletion == nil || !*ref.BlockOwnerDeletion {
+				continue
+			}
+			state, err := g.ownerState(ctx, n.namespace, ref)
+			if err != nil {
+				return err
+			}
+			if state == ownerWaiting {
+				refs[i].BlockOwnerDeletion = ptr.To(false)
+				changed = true
+			}
+		}
+		if changed {
+			return g.patch(ctx, n, uid, map[string]any{"metadata": map[string]any{"ownerReferences": refs, "uid": uid}})
+		}
+	}
 	blocking := 0
 	for _, dep := range g.dependentsOf(uid) {
 		d := g.node(dep)
