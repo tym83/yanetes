@@ -160,7 +160,11 @@ FieldSelector FieldSelector::Parse(const std::string& text) {
 
 bool FieldSelector::Matches(const json::Value& object) const {
     for (const auto& t : terms_) {
-        bool eq = Scalar(AtPath(object, t.path)) == t.value;
+        // An absent field is its type's zero, as in the Go structs upstream
+        // selects on: spec.unschedulable=false matches a node without it.
+        const auto v = AtPath(object, t.path);
+        bool eq = (v.IsMissing() || v.IsNull()) ? (t.value.empty() || t.value == "false" || t.value == "0")
+                                                : Scalar(v) == t.value;
         if (eq != t.equal) return false;
     }
     return true;

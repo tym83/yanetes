@@ -384,7 +384,8 @@ void Quotas(Store& store, const Resource& r, const Value& object) {
                 // A quota on pod compute makes every pod say what it needs.
                 if (it == usage.end()) {
                     if (r.group.empty() && r.plural == "pods" &&
-                        (res.starts_with("requests.") || res.starts_with("limits.") || res == "cpu" || res == "memory")) {
+                        (res == "requests.cpu" || res == "requests.memory" || res == "limits.cpu" || res == "limits.memory" ||
+                         res == "cpu" || res == "memory")) {
                         missing.push_back(res);
                     }
                     continue;

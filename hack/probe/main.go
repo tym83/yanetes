@@ -1,17 +1,18 @@
-// probe creates a ValidatingWebhookConfiguration through a protobuf client
-// and prints what the server kept, to check the protobuf decoder.
+// probe reproduces what conformance tests do against the server, one
+// scenario at a time, and prints what came back.
 package main
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
-	admissionv1 "k8s.io/api/admissionregistration/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/utils/ptr"
 )
 
 func main() {
@@ -21,24 +22,23 @@ func main() {
 	}
 	cfg.ContentType = "application/vnd.kubernetes.protobuf"
 	c := kubernetes.NewForConfigOrDie(cfg)
-	none := admissionv1.SideEffectClassNone
-	v := &admissionv1.ValidatingWebhookConfiguration{
-		ObjectMeta: metav1.ObjectMeta{Name: "probe-proto"},
-		Webhooks: []admissionv1.ValidatingWebhook{{
-			Name: "probe.example.com", SideEffects: &none, AdmissionReviewVersions: []string{"v1"},
-			ClientConfig: admissionv1.WebhookClientConfig{URL: ptr.To("https://example.invalid/x")},
-		}},
+	ctx := context.Background()
+	ns := "probe-watch"
+	_, _ = c.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
+	cms := c.CoreV1().ConfigMaps(ns)
+	_, err = cms.Create(ctx, &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "w", Labels: map[string]string{"special": "x"}}}, metav1.CreateOptions{})
+	fmt.Println("create:", err)
+	list, err := cms.List(ctx, metav1.ListOptions{LabelSelector: "special=x"})
+	fmt.Println("list:", err, list.ResourceVersion, len(list.Items))
+	w, err := cms.Watch(ctx, metav1.ListOptions{ResourceVersion: list.ResourceVersion, LabelSelector: "special=x"})
+	fmt.Println("watch:", err)
+	_, err = cms.Patch(ctx, "w", types.MergePatchType, []byte(`{"metadata":{"annotations":{"patched":"true"}}}`), metav1.PatchOptions{})
+	fmt.Println("patch:", err)
+	select {
+	case evt, ok := <-w.ResultChan():
+		fmt.Printf("event ok=%v type=%v obj=%T %v\n", ok, evt.Type, evt.Object, evt.Object)
+	case <-time.After(10 * time.Second):
+		fmt.Println("no event in 10s")
 	}
-	got, err := c.AdmissionregistrationV1().ValidatingWebhookConfigurations().Create(context.Background(), v, metav1.CreateOptions{})
-	fmt.Println("err:", err)
-	if got != nil {
-		fmt.Println("webhooks kept:", len(got.Webhooks))
-		got.Webhooks[0].Rules = []admissionv1.RuleWithOperations{{Operations: []admissionv1.OperationType{admissionv1.Update}}}
-		upd, err := c.AdmissionregistrationV1().ValidatingWebhookConfigurations().Update(context.Background(), got, metav1.UpdateOptions{})
-		fmt.Println("update err:", err)
-		if upd != nil {
-			fmt.Println("after update:", len(upd.Webhooks))
-		}
-	}
-	_ = c.AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(context.Background(), "probe-proto", metav1.DeleteOptions{})
+	_ = c.CoreV1().Namespaces().Delete(ctx, ns, metav1.DeleteOptions{})
 }

@@ -35,7 +35,20 @@ b cxx "set -e; o=/work/out/cp; mkdir -p \$o/bin \$o/lib \$o/etc
   cp /work/src/yapi/configs/static_config.yaml \$o/etc/
   cp -r /work/proto /work/openapi \$o/"
 b go "cp /work/bin/nanny /work/bin/yplanner /work/out/cp/bin/"
-b cxx "tar -C /work/out/cp -czf - ." | vm "$NODE" "sudo mkdir -p /opt/yandexnetes && sudo tar -xzf - -C /opt/yandexnetes"
+# Each release unpacks into a directory of its own and "current" moves to
+# it at once: files rewritten in place under a running process crash it
+# (SIGBUS), and a transfer cut short must not leave a half-written library.
+# The node fetches the bundle from the builder over the pod network: a
+# stream through this machine's link is the slow, breakable part.
+REL=$(date -u +%Y%m%d%H%M%S)
+BUILDER=$("${K[@]}" get pod builder -o jsonpath='{.status.podIP}')
+b cxx "set -e; mkdir -p /work/out/www; tar -C /work/out/cp -czf /work/out/www/cp-$REL.tgz .
+  curl -fs -o /dev/null http://127.0.0.1:8099/ || (setsid nohup python3 -m http.server 8099 --directory /work/out/www >/dev/null 2>&1 < /dev/null &)
+  sleep 1"
+vm "$NODE" "set -e; sudo mkdir -p /opt/yandexnetes/releases/$REL
+  curl -fsS http://$BUILDER:8099/cp-$REL.tgz | sudo tar -xzf - -C /opt/yandexnetes/releases/$REL
+  sudo test -x /opt/yandexnetes/releases/$REL/bin/yapi
+  sudo ln -sfn /opt/yandexnetes/releases/$REL /opt/yandexnetes/current.new && sudo mv -T /opt/yandexnetes/current.new /opt/yandexnetes/current"
 
 if [ "$MODE" != restart ]; then
   # A serving certificate that names the node too, from the same CA.
@@ -59,8 +72,8 @@ port: 6443
 tls-cert: /etc/yandexnetes/cp/pki/tls-chain.crt
 tls-key: /etc/yandexnetes/cp/pki/tls.key
 tokens-file: /etc/yandexnetes/cp/tokens.csv
-openapi-dir: /opt/yandexnetes/openapi
-proto-dir: /opt/yandexnetes/proto
+openapi-dir: /opt/yandexnetes/current/openapi
+proto-dir: /opt/yandexnetes/current/proto
 ydb-endpoint: ydb.$NS.svc.cozy.local:2136
 ydb-database: /local
 worker-threads: 4
@@ -75,8 +88,8 @@ unit yapi <<EOF
 [Unit]
 After=network-online.target
 [Service]
-Environment=LD_LIBRARY_PATH=/opt/yandexnetes/lib
-ExecStart=/opt/yandexnetes/bin/yapi --config /opt/yandexnetes/etc/static_config.yaml --config_vars /etc/yandexnetes/cp/config_vars.yaml
+Environment=LD_LIBRARY_PATH=/opt/yandexnetes/current/lib
+ExecStart=/opt/yandexnetes/current/bin/yapi --config /opt/yandexnetes/current/etc/static_config.yaml --config_vars /etc/yandexnetes/cp/config_vars.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -87,7 +100,7 @@ unit nanny <<EOF
 [Unit]
 After=yapi.service
 [Service]
-ExecStart=/opt/yandexnetes/bin/nanny --kubeconfig /etc/yandexnetes/cp/local.conf --root-ca-file /etc/yandexnetes/cp/pki/ca.crt
+ExecStart=/opt/yandexnetes/current/bin/nanny --kubeconfig /etc/yandexnetes/cp/local.conf --root-ca-file /etc/yandexnetes/cp/pki/ca.crt
 Restart=always
 RestartSec=3
 [Install]
@@ -97,7 +110,7 @@ unit yplanner <<EOF
 [Unit]
 After=yapi.service
 [Service]
-ExecStart=/opt/yandexnetes/bin/yplanner --kubeconfig /etc/yandexnetes/cp/local.conf
+ExecStart=/opt/yandexnetes/current/bin/yplanner --kubeconfig /etc/yandexnetes/cp/local.conf
 Restart=always
 RestartSec=3
 [Install]

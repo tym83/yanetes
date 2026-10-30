@@ -29,7 +29,8 @@ Resource R(
         std::move(short_names),
         std::move(categories),
         std::move(verbs),
-        nullptr};
+        nullptr,
+        ""};
 }
 
 std::vector<Resource> BuiltinResources() {
@@ -85,6 +86,7 @@ std::vector<Resource> BuiltinResources() {
         R("networking.k8s.io", "v1", "ingressclasses", "ingressclass", "IngressClass", kCluster, kPlain),
         R("policy", "v1", "poddisruptionbudgets", "poddisruptionbudget", "PodDisruptionBudget", kNs, kStatus, {"pdb"}),
         R("autoscaling", "v2", "horizontalpodautoscalers", "horizontalpodautoscaler", "HorizontalPodAutoscaler", kNs, kStatus, {"hpa"}, {"all"}),
+        R("autoscaling", "v1", "horizontalpodautoscalers", "horizontalpodautoscaler", "HorizontalPodAutoscaler", kNs, kStatus, {"hpa"}, {"all"}),
         R("apiextensions.k8s.io", "v1", "customresourcedefinitions", "customresourcedefinition", "CustomResourceDefinition", kCluster, kStatus, {"crd", "crds"}),
         R("admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations", "mutatingwebhookconfiguration", "MutatingWebhookConfiguration", kCluster, kPlain),
         R("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations", "validatingwebhookconfiguration", "ValidatingWebhookConfiguration", kCluster, kPlain),
@@ -111,7 +113,13 @@ std::vector<Resource> BuiltinResources() {
 }  // namespace
 
 const Registry& Registry::Builtin() {
-    static const Registry registry(BuiltinResources());
+    static const Registry registry([] {
+        auto resources = BuiltinResources();
+        for (auto& r : resources) {
+            if (r.group == "events.k8s.io") r.storage_key = "events";
+        }
+        return resources;
+    }());
     return registry;
 }
 

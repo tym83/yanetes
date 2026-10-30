@@ -34,6 +34,7 @@ add_library(yapi_objs OBJECT
     src/policies.cpp
     src/bodies.cpp
     src/validation.cpp
+    src/conversion.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)

@@ -94,7 +94,11 @@ Value Schema::Walk(const Value& raw, const Value& value, const std::string& path
             if (!typed) Invalid(f, path, value, path + " in body must be of type object: " + Show(value));
             return value;
         }
-        const bool preserve = s["x-kubernetes-preserve-unknown-fields"].As<bool>(false);
+        // In the built-in types an object with no fields named is free-form
+        // (RawExtension: a ControllerRevision's data); only a custom
+        // resource's schema prunes it empty.
+        const bool preserve = s["x-kubernetes-preserve-unknown-fields"].As<bool>(false) ||
+                              (typed && !s.HasMember("properties") && !s.HasMember("additionalProperties"));
         const bool embedded = s["x-kubernetes-embedded-resource"].As<bool>(false);
         const auto props = s["properties"];
         const auto additional = s["additionalProperties"];

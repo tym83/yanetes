@@ -27,6 +27,7 @@
 #include <admission.hpp>
 #include <auth.hpp>
 #include <bodies.hpp>
+#include <conversion.hpp>
 #include <crds.hpp>
 #include <kubelet.hpp>
 #include <objects.hpp>
@@ -342,13 +343,6 @@ Value Group(const Registry& reg, const std::string& name) {
     return g.ExtractValue();
 }
 
-std::string ReadFile(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    if (!in) return "";
-    std::stringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
-}
 
 std::string Arg(const http::HttpRequest& req, std::string_view name) { return req.GetArg(name); }
 
@@ -657,6 +651,20 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         (IsPod(*t.resource) || IsService(*t.resource) || (t.resource->group.empty() && t.resource->plural == "nodes"))) {
         std::string path;
         for (std::size_t i = 3; i < rest.size(); ++i) path += "/" + rest[i];
+        // .../proxy without a slash: GET and HEAD are sent to .../proxy/, as
+        // upstream redirects them, so relative links resolve inside the proxy.
+        if (rest.size() == 3 && !request.GetRequestPath().ends_with("/") &&
+            (method == http::HttpMethod::kGet || method == http::HttpMethod::kHead)) {
+            std::string query;
+            for (const auto& arg : request.ArgNames()) {
+                for (const auto& v : request.GetArgVector(arg)) {
+                    query += (query.empty() ? "?" : "&") + userver::http::UrlEncode(arg) + "=" + userver::http::UrlEncode(v);
+                }
+            }
+            response.SetStatus(http::HttpStatus::kMovedPermanently);
+            response.SetHeader(std::string("Location"), request.GetRequestPath() + "/" + query);
+            return "";
+        }
         if (path.empty() || request.GetRequestPath().ends_with("/")) path += "/";
         return Proxy(request, *t.resource, t.ns, rest[1], path);
     }
@@ -679,6 +687,12 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
     const auto include_object = Arg(request, "includeObject");
 
     if (r.CreateOnly()) {
+        // Reviews have no table form; a client that will take nothing else
+        // gets 406, as upstream answers.
+        if (table && request.GetHeader("Accept").find("application/json,") == std::string::npos &&
+            !request.GetHeader("Accept").ends_with("application/json")) {
+            throw ApiError(406, "NotAcceptable", "the server was unable to respond with a content type that the client supports");
+        }
         if (method != http::HttpMethod::kPost || !t.name.empty()) {
             throw MethodNotAllowed("the server does not allow this method on the requested resource");
         }
@@ -983,6 +997,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 if (IsDefinitions(r) && !status_write) Crds::Validate(next);
                 if (IsWebhookConfig(r)) Webhooks::ValidateConfig(r, next);
                 validation::Validate(r, next);
+                validation::ValidateUpdate(r, *current, next);
                 if (IsService(r) && !status_write && !dry_run) next = services_.Assign(next, current, change);
             }
             next = ToStorage(r, next);
@@ -1087,6 +1102,8 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 b["metadata"]["deletionTimestamp"] = objects::Now();
                 b["metadata"]["deletionGracePeriodSeconds"] = grace;
                 if (IsNamespace(r)) b["status"]["phase"] = "Terminating";
+                // A pod's graceful deletion is a change its kubelet acts on.
+                if (IsPod(r) && grace > 0) b["metadata"]["generation"] = (*current)["metadata"]["generation"].As<std::int64_t>(1) + 1;
             }
             auto next = b.ExtractValue();
             if (Releasable(r, next)) return Decision::Remove(next);
@@ -1277,12 +1294,23 @@ void Api::Warn(const http::HttpRequest& request, const std::vector<std::string>&
 }
 
 Value Api::ToView(const Resource& r, const Value& object) const {
-    if (!r.custom || !object.IsObject() || object["apiVersion"].As<std::string>("") == r.GroupVersion()) return object;
+    if (conversion::Converted(r)) return conversion::ToServed(r, object);
+    if (!r.custom || !object.IsObject()) return object;
+    if (object["apiVersion"].As<std::string>("") == r.GroupVersion()) {
+        // Defaults apply on the way out too: a default added to the schema
+        // shows on objects stored before it.
+        if (auto schema = crds_.SchemaFor(r)) {
+            schema::Findings ignored;
+            return schema->Apply(object, ignored);
+        }
+        return object;
+    }
     if (r.custom->webhook_conversion) return webhooks_.Convert(*r.custom, {object}, r.GroupVersion()).front();
     return crds_.Convert(r, object, r.version);
 }
 
 Value Api::ToStorage(const Resource& r, const Value& object) const {
+    if (conversion::Converted(r)) return conversion::ToStored(r, object);
     if (!r.custom || !object.IsObject()) return object;
     const auto storage = r.group + "/" + r.custom->storage_version;
     if (object["apiVersion"].As<std::string>("") == storage) return object;
@@ -1343,6 +1371,14 @@ std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, cons
         if (!pod) throw NotFound("pods", "", name);
         host = (*pod)["status"]["podIP"].As<std::string>("");
         if (host.empty()) throw ApiError(503, "ServiceUnavailable", "address not allowed");
+        // No port named: the first one a container declares, as upstream picks.
+        for (const auto& c : objects::Items((*pod)["spec"]["containers"])) {
+            if (!port.empty()) break;
+            for (const auto& p : objects::Items(c["ports"])) {
+                port = std::to_string(p["containerPort"].As<int>(0));
+                break;
+            }
+        }
         if (scheme.empty()) scheme = "http";
     } else if (IsService(r)) {
         auto svc = store_.Get(r, ns, name);
@@ -1422,7 +1458,23 @@ std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, cons
         if (lower == "content-length" || lower == "transfer-encoding" || lower == "connection" || lower == "content-encoding") continue;
         response.SetHeader(std::string(k), v);
     }
-    return answer->body();
+    // Links in a proxied page point back through the proxy, as upstream's
+    // transport rewrites them.
+    auto body = answer->body();
+    const std::string content_type_name = "Content-Type";
+    const auto& answer_headers = answer->headers();
+    const auto ct = answer_headers.find(content_type_name);
+    if (ct != answer_headers.end() && ct->second.find("text/html") != std::string::npos) {
+        const auto prefix = "/api/v1/" + (ns.empty() ? std::string() : "namespaces/" + ns + "/") + r.plural + "/" + spec + "/proxy";
+        for (const char* attr : {"href=\"", "src=\"", "action=\""}) {
+            std::string a(attr);
+            for (std::size_t pos = body.find(a + "/"); pos != std::string::npos; pos = body.find(a + "/", pos + a.size() + prefix.size())) {
+                if (body.compare(pos + a.size(), 2, "//") == 0) continue;
+                body.insert(pos + a.size(), prefix);
+            }
+        }
+    }
+    return body;
 }
 
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
@@ -1614,13 +1666,18 @@ void Api::HandleStreamRequest(
         auto sub = watch_.Subscribe(r, after);
         stream.SetStatusCode(200);
         stream.SetEndOfHeaders();
+        // The headers leave with the first piece of body. A watch with
+        // nothing to say yet must still answer, or the client waits in
+        // Watch() for a change it has not made yet: a newline, which the
+        // JSON stream decoder skips.
+        stream.PushBodyChunk("\n", deadline);
         const bool table = tables::Wanted(request.GetHeader("Accept"));
         const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
         const auto include_object = Arg(request, "includeObject");
         bool columns_sent = false;
         auto send = [&](const Value& raw) {
             Value event = raw;
-            if (r.custom && raw["type"].As<std::string>("") != "ERROR" && raw["type"].As<std::string>("") != "BOOKMARK") {
+            if ((r.custom || conversion::Converted(r)) && raw["type"].As<std::string>("") != "ERROR" && raw["type"].As<std::string>("") != "BOOKMARK") {
                 ValueBuilder b(raw);
                 b["object"] = ToView(r, raw["object"]);
                 event = b.ExtractValue();

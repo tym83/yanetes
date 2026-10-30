@@ -43,12 +43,18 @@ struct Resource {
     std::vector<std::string> verbs;
     // Set for resources a CustomResourceDefinition serves.
     std::shared_ptr<const CustomInfo> custom;
+    // Set when another resource's storage holds these objects in its shape
+    // (events.k8s.io events are core events).
+    std::string storage_key;
 
     bool CreateOnly() const { return verbs.size() == 1 && verbs[0] == "create"; }
 
     // The storage key of the resource: its revisions are counted per key,
     // whatever version a client speaks.
-    std::string Key() const { return group.empty() ? plural : plural + "." + group; }
+    std::string Key() const {
+        if (!storage_key.empty()) return storage_key;
+        return group.empty() ? plural : plural + "." + group;
+    }
     std::string GroupVersion() const { return group.empty() ? version : group + "/" + version; }
 };
 

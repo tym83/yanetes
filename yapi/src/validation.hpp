@@ -10,4 +10,8 @@ namespace yapi::validation {
 // worded the same way. Throws ApiError (422) listing every problem.
 void Validate(const Resource& r, const userver::formats::json::Value& object);
 
+// What an update may not change: data of an immutable ConfigMap or Secret,
+// and immutable itself once set.
+void ValidateUpdate(const Resource& r, const userver::formats::json::Value& old_object, const userver::formats::json::Value& object);
+
 }  // namespace yapi::validation

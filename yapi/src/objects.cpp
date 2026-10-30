@@ -39,6 +39,11 @@ bool DnsSubdomain(const std::string& name, std::size_t max = 253, bool dots = tr
 std::string NameProblem(const Resource& r, const std::string& name) {
     // An IP address names itself; validation checks it is one.
     if (r.group == "networking.k8s.io" && r.plural == "ipaddresses") return "";
+    // Trust bundles are named signer:name:suffix.
+    if (r.group == "certificates.k8s.io" && r.plural == "clustertrustbundles") {
+        if (name.find('/') != std::string::npos || name.find('%') != std::string::npos) return "may not contain '/' or '%'";
+        return "";
+    }
     if (r.group == "rbac.authorization.k8s.io") {
         if (name == "." || name == "..") return "may not be '" + name + "'";
         if (name.find('/') != std::string::npos) return "may not contain '/'";

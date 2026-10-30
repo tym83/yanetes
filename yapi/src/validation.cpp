@@ -129,4 +129,23 @@ void Validate(const Resource& r, const Value& object) {
     throw Invalid(r.kind, r.group, objects::Name(object), msg);
 }
 
+void ValidateUpdate(const Resource& r, const Value& old_object, const Value& object) {
+    if (!(r.group.empty() && (r.plural == "configmaps" || r.plural == "secrets"))) return;
+    if (!old_object["immutable"].As<bool>(false)) return;
+    Problems p;
+    if (!object["immutable"].As<bool>(false)) p.push_back("immutable: Forbidden: field is immutable when `immutable` is set");
+    for (const char* field : {"data", "binaryData", "type"}) {
+        const auto a = old_object[field], b = object[field];
+        const bool same = (a.IsMissing() && b.IsMissing()) || (!a.IsMissing() && !b.IsMissing() && a == b);
+        if (!same) p.push_back(std::string(field) + ": Forbidden: field is immutable when `immutable` is set");
+    }
+    if (p.empty()) return;
+    std::string msg = p.size() == 1 ? p[0] : "[";
+    if (p.size() > 1) {
+        for (std::size_t i = 0; i < p.size(); ++i) msg += (i ? ", " : "") + p[i];
+        msg += "]";
+    }
+    throw Invalid(r.kind, r.group, objects::Name(object), msg);
+}
+
 }  // namespace yapi::validation

@@ -29,3 +29,9 @@ TEST(FieldSelector, Paths) {
     EXPECT_EQ(yapi::FieldSelector::Parse("metadata.namespace=n").Pinned("metadata.namespace"), "n");
     EXPECT_THROW(yapi::FieldSelector::Parse("nonsense"), yapi::ApiError);
 }
+
+TEST(FieldSelector, AbsentIsZero) {
+    auto node = userver::formats::json::FromString(R"({"spec":{}})");
+    EXPECT_TRUE(yapi::FieldSelector::Parse("spec.unschedulable=false").Matches(node));
+    EXPECT_FALSE(yapi::FieldSelector::Parse("spec.unschedulable=true").Matches(node));
+}
