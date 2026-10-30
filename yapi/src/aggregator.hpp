@@ -3,6 +3,7 @@
 #include <chrono>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,7 @@
 #include <userver/engine/mutex.hpp>
 #include <userver/formats/json/value.hpp>
 #include <userver/server/http/http_request.hpp>
+#include <userver/utils/periodic_task.hpp>
 
 #include <auth.hpp>
 
@@ -26,6 +28,7 @@ public:
     static constexpr std::string_view kName = "yapi-aggregator";
 
     Aggregator(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context);
+    ~Aggregator() override;
 
     static userver::yaml_config::Schema GetStaticConfigSchema();
 
@@ -44,6 +47,10 @@ public:
     // Sends the request on and writes the answer into its response.
     std::string Forward(const userver::server::http::HttpRequest& request, const Remote& remote, const User& user) const;
 
+    // Checks availability now, not at the next period: a client that just
+    // registered an APIService reads its status next.
+    void Kick() const;
+
     // The remote server's APIResourceList for its group version, fetched
     // now and then.
     std::optional<userver::formats::json::Value> Resources(const Remote& remote) const;
@@ -55,9 +62,13 @@ private:
         const std::string& path_and_query,
         const std::string& body,
         const std::vector<std::pair<std::string, std::string>>& headers,
-        const User* user
+        const User* user,
+        std::chrono::seconds timeout
     ) const;
     void PublishAuthentication(const std::string& client_ca, const std::string& requestheader_ca) const;
+    // Keeps every APIService's Available condition true to what answers.
+    void CheckAvailability();
+    std::optional<userver::formats::json::Value> Fetch(const Remote& remote, std::string& why) const;
 
     Store& store_;
     userver::clients::http::Client& http_;
@@ -69,6 +80,8 @@ private:
     };
     mutable userver::engine::Mutex mutex_;
     mutable std::map<std::string, Cached> cache_;
+    std::set<std::string> seen_up_;  // group versions last found available
+    mutable userver::utils::PeriodicTask availability_;
 };
 
 }  // namespace yapi

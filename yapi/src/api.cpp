@@ -538,6 +538,10 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         request.GetRequestPath().find("admissionpolic") != std::string::npos) {
         policies_.Refresh();
     }
+    if (method != http::HttpMethod::kGet && method != http::HttpMethod::kHead &&
+        request.GetRequestPath().find("/apis/apiregistration.k8s.io/") == 0) {
+        aggregator_.Kick();
+    }
     return out;
 }
 

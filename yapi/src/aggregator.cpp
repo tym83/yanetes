@@ -13,6 +13,7 @@
 #include <userver/crypto/private_key.hpp>
 #include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value_builder.hpp>
+#include <userver/http/common_headers.hpp>
 #include <userver/http/url.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/server/http/http_response.hpp>
@@ -32,6 +33,9 @@ using json::ValueBuilder;
 namespace {
 
 constexpr auto kResourcesFor = std::chrono::seconds(10);
+// A server that does not answer discovery within this is unavailable, and
+// the checks of the others do not wait on it longer.
+constexpr auto kCheckTimeout = std::chrono::seconds(5);
 
 std::string ReadFile(const std::string& path) {
     if (path.empty()) return "";
@@ -56,7 +60,12 @@ Aggregator::Aggregator(const userver::components::ComponentConfig& config, const
     PublishAuthentication(
         ReadFile(config["client-ca-file"].As<std::string>("")), ReadFile(config["requestheader-client-ca-file"].As<std::string>(""))
     );
+    availability_.Start("apiservice-availability", {std::chrono::seconds(2)}, [this] { CheckAvailability(); });
 }
+
+Aggregator::~Aggregator() { availability_.Stop(); }
+
+void Aggregator::Kick() const { availability_.ForceStepAsync(); }
 
 userver::yaml_config::Schema Aggregator::GetStaticConfigSchema() {
     return userver::yaml_config::MergeSchemas<ComponentBase>(R"(
@@ -134,7 +143,8 @@ std::shared_ptr<userver::clients::http::Response> Aggregator::Send(
     const std::string& path_and_query,
     const std::string& body,
     const std::vector<std::pair<std::string, std::string>>& headers,
-    const User* user
+    const User* user,
+    std::chrono::seconds timeout
 ) const {
     const auto svc = remote.apiservice["spec"]["service"];
     const auto ns = svc["namespace"].As<std::string>("");
@@ -150,7 +160,7 @@ std::shared_ptr<userver::clients::http::Response> Aggregator::Send(
     auto out = http_.CreateRequest();
     out.method(client::HttpMethodFromString(method))
         .url("https://" + host + ":" + std::to_string(port) + path_and_query)
-        .timeout(std::chrono::seconds(60))
+        .timeout(timeout)
         .connect_to(connect_to);
     if (!body.empty()) out.data(body);
     const auto ca = remote.apiservice["spec"]["caBundle"].As<std::string>("");
@@ -199,7 +209,21 @@ std::string Aggregator::Forward(const userver::server::http::HttpRequest& reques
         }
         headers.emplace_back(std::string(name), request.GetHeader(name));
     }
-    auto answer = Send(remote, request.GetMethodStr(), request.GetRequestPath() + query, request.RequestBody(), headers, &user);
+    // A body of no stated type is JSON to an API server; left out, curl
+    // would call it a form.
+    const auto content_type = request.GetHeader(userver::http::headers::kContentType);
+    if (!content_type.empty()) {
+        headers.emplace_back("Content-Type", content_type);
+    } else if (!request.RequestBody().empty()) {
+        headers.emplace_back("Content-Type", "application/json");
+    }
+    auto answer = Send(remote, request.GetMethodStr(), request.GetRequestPath() + query, request.RequestBody(), headers, &user, std::chrono::seconds(60));
+    // A server that answers may have just come up: its APIService says so
+    // before the next period.
+    if (answer->status_code() < 500) {
+        std::lock_guard lock(mutex_);
+        if (!seen_up_.count(remote.group + "/" + remote.version)) Kick();
+    }
     auto& response = request.GetHttpResponse();
     response.SetStatus(static_cast<userver::server::http::HttpStatus>(static_cast<int>(answer->status_code())));
     for (const auto& [k, v] : answer->headers()) {
@@ -211,25 +235,87 @@ std::string Aggregator::Forward(const userver::server::http::HttpRequest& reques
     return answer->body();
 }
 
-std::optional<Value> Aggregator::Resources(const Remote& remote) const {
+std::optional<Value> Aggregator::Fetch(const Remote& remote, std::string& why) const {
     const auto key = remote.group + "/" + remote.version;
-    {
-        std::lock_guard lock(mutex_);
-        auto it = cache_.find(key);
-        if (it != cache_.end() && std::chrono::steady_clock::now() - it->second.at < kResourcesFor) return it->second.resources;
-    }
-    Value resources;
     try {
-        auto answer = Send(remote, "GET", "/apis/" + key, "", {{"Accept", "application/json"}}, nullptr);
-        if (answer->status_code() != userver::clients::http::Status::kOk) return std::nullopt;
-        resources = json::FromString(answer->body());
+        // Asked as upstream's aggregator asks, under a name of its own.
+        static const User kSelf{"system:kube-aggregator", "", {"system:masters"}, {}};
+        auto answer = Send(remote, "GET", "/apis/" + key, "", {{"Accept", "application/json"}}, &kSelf, kCheckTimeout);
+        if (answer->status_code() != userver::clients::http::Status::kOk) {
+            why = "failing or missing response from /apis/" + key + ": bad status from /apis/" + key + ": " +
+                  std::to_string(static_cast<int>(answer->status_code()));
+            return std::nullopt;
+        }
+        auto resources = json::FromString(answer->body());
+        std::lock_guard lock(mutex_);
+        cache_[key] = {std::chrono::steady_clock::now(), resources};
+        return resources;
     } catch (const std::exception& e) {
-        LOG_INFO() << "aggregator: no discovery from " << key << ": " << e.what();
+        why = "failing or missing response from /apis/" + key + ": " + e.what();
         return std::nullopt;
     }
-    std::lock_guard lock(mutex_);
-    cache_[key] = {std::chrono::steady_clock::now(), resources};
-    return resources;
+}
+
+std::optional<Value> Aggregator::Resources(const Remote& remote) const {
+    {
+        std::lock_guard lock(mutex_);
+        auto it = cache_.find(remote.group + "/" + remote.version);
+        if (it != cache_.end() && std::chrono::steady_clock::now() - it->second.at < kResourcesFor) return it->second.resources;
+    }
+    std::string why;
+    return Fetch(remote, why);
+}
+
+void Aggregator::CheckAvailability() {
+    const auto& kind = Kind("apiregistration.k8s.io", "apiservices");
+    for (const auto& svc : store_.List(kind, "", 0, "", "").items) {
+        ValueBuilder want(json::Type::kObject);
+        want["type"] = "Available";
+        if (!svc["spec"]["service"].IsObject()) {
+            want["status"] = "True";
+            want["reason"] = "Local";
+            want["message"] = "Local APIServices are always available";
+        } else {
+            std::string why;
+            Remote remote{svc["spec"]["group"].As<std::string>(""), svc["spec"]["version"].As<std::string>(""), svc};
+            const bool up = Fetch(remote, why).has_value();
+            {
+                std::lock_guard lock(mutex_);
+                if (up) {
+                    seen_up_.insert(remote.group + "/" + remote.version);
+                } else {
+                    seen_up_.erase(remote.group + "/" + remote.version);
+                }
+            }
+            want["status"] = up ? "True" : "False";
+            want["reason"] = up ? "Passed" : "FailedDiscoveryCheck";
+            want["message"] = up ? "all checks passed" : why;
+        }
+        const auto condition = want.ExtractValue();
+        store_.Write(kind, "", objects::Name(svc), [&](const std::optional<Value>& current) {
+            if (!current) return Decision::Keep();
+            ValueBuilder updated(*current);
+            ValueBuilder conditions(json::Type::kArray);
+            bool same = false;
+            for (const auto& c : objects::Items((*current)["status"]["conditions"])) {
+                if (c["type"].As<std::string>("") != "Available") {
+                    conditions.PushBack(c);
+                    continue;
+                }
+                same = c["status"] == condition["status"] && c["reason"] == condition["reason"] && c["message"] == condition["message"];
+                if (same) conditions.PushBack(c);
+            }
+            if (same) return Decision::Keep();
+            ValueBuilder fresh(condition);
+            fresh["lastTransitionTime"] = objects::Now();
+            // Available goes first, where clients look for it.
+            ValueBuilder ordered(json::Type::kArray);
+            ordered.PushBack(fresh.ExtractValue());
+            for (const auto& c : conditions.ExtractValue()) ordered.PushBack(c);
+            updated["status"]["conditions"] = ordered;
+            return Decision::Put(objects::PrepareUpdate(kind, *current, updated.ExtractValue(), true));
+        });
+    }
 }
 
 }  // namespace yapi
