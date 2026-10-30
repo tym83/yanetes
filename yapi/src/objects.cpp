@@ -23,15 +23,34 @@ std::string RandomSuffix() {
     return s;
 }
 
-bool ValidName(const std::string& name) {
-    if (name.empty() || name.size() > 253) return false;
+bool DnsSubdomain(const std::string& name, std::size_t max = 253, bool dots = true) {
+    if (name.empty() || name.size() > max) return false;
     for (char c : name) {
         if (!(std::islower(static_cast<unsigned char>(c)) || std::isdigit(static_cast<unsigned char>(c)) || c == '-' ||
-              c == '.')) {
+              (dots && c == '.'))) {
             return false;
         }
     }
     return std::isalnum(static_cast<unsigned char>(name.front())) && std::isalnum(static_cast<unsigned char>(name.back()));
+}
+
+// Names the way upstream validates them per kind; an empty string when
+// the name will do, else what is wrong with it.
+std::string NameProblem(const Resource& r, const std::string& name) {
+    if (r.group == "rbac.authorization.k8s.io") {
+        if (name == "." || name == "..") return "may not be '" + name + "'";
+        if (name.find('/') != std::string::npos) return "may not contain '/'";
+        if (name.find('%') != std::string::npos) return "may not contain '%'";
+        return "";
+    }
+    if (r.group.empty() && r.plural == "namespaces") {
+        return DnsSubdomain(name, 63, false) ? "" : "a lowercase RFC 1123 label must consist of lower case alphanumeric characters or '-', and must start and end with an alphanumeric character";
+    }
+    if (r.group.empty() && r.plural == "services") {
+        bool ok = DnsSubdomain(name, 63, false) && std::islower(static_cast<unsigned char>(name.front()));
+        return ok ? "" : "a DNS-1035 label must consist of lower case alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character";
+    }
+    return DnsSubdomain(name) ? "" : "a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.', and must start and end with an alphanumeric character";
 }
 
 // A builder copied by value is a deep copy; the child builders operator[]
@@ -50,7 +69,39 @@ bool HasTag(const std::string& image) {
     return colon != std::string::npos && (slash == std::string::npos || colon > slash);
 }
 
-json::Value ContainerDefaults(const json::Value& container) {
+json::Value Object(const json::Value& v) { return v.IsObject() ? v : json::ValueBuilder(json::Type::kObject).ExtractValue(); }
+
+// A handler of a probe or a lifecycle hook.
+json::Value HandlerDefaults(const json::Value& handler) {
+    json::ValueBuilder h(handler);
+    if (handler["httpGet"].IsObject()) {
+        SetIfMissing(h["httpGet"], "path", "/");
+        SetIfMissing(h["httpGet"], "scheme", "HTTP");
+    }
+    return h.ExtractValue();
+}
+
+json::Value ProbeDefaults(const json::Value& probe) {
+    json::ValueBuilder p(HandlerDefaults(probe));
+    SetIfMissing(p, "timeoutSeconds", 1);
+    SetIfMissing(p, "periodSeconds", 10);
+    SetIfMissing(p, "successThreshold", 1);
+    SetIfMissing(p, "failureThreshold", 3);
+    return p.ExtractValue();
+}
+
+json::Value FieldRefDefaults(const json::Value& items) {
+    json::ValueBuilder out(json::Type::kArray);
+    for (const auto& item : items) {
+        json::ValueBuilder ib(item);
+        if (item["fieldRef"].IsObject()) SetIfMissing(ib["fieldRef"], "apiVersion", "v1");
+        if (item["valueFrom"]["fieldRef"].IsObject()) SetIfMissing(ib["valueFrom"]["fieldRef"], "apiVersion", "v1");
+        out.PushBack(ib.ExtractValue());
+    }
+    return out.ExtractValue();
+}
+
+json::Value ContainerDefaults(const json::Value& container, bool host_network) {
     json::ValueBuilder c(container);
     SetIfMissing(c, "terminationMessagePath", "/dev/termination-log");
     SetIfMissing(c, "terminationMessagePolicy", "File");
@@ -59,21 +110,57 @@ json::Value ContainerDefaults(const json::Value& container) {
         bool latest = !HasTag(image) || image.ends_with(":latest");
         c["imagePullPolicy"] = latest && image.find('@') == std::string::npos ? "Always" : "IfNotPresent";
     }
-    SetIfMissing(c, "resources", json::ValueBuilder(json::Type::kObject));
+    // Limits without requests ask for what they allow, as upstream defaults.
+    json::ValueBuilder resources(Object(container["resources"]));
+    const auto limits = container["resources"]["limits"];
+    if (limits.IsObject()) {
+        for (auto it = limits.begin(); it != limits.end(); ++it) {
+            if (!container["resources"]["requests"].HasMember(it.GetName())) resources["requests"][it.GetName()] = *it;
+        }
+    }
+    c["resources"] = resources;
     if (container["ports"].IsArray()) {
         json::ValueBuilder ports(json::Type::kArray);
         for (const auto& p : container["ports"]) {
             json::ValueBuilder pb(p);
             SetIfMissing(pb, "protocol", "TCP");
+            if (host_network && p["hostPort"].As<int>(0) == 0) pb["hostPort"] = p["containerPort"];
             ports.PushBack(pb.ExtractValue());
         }
         c["ports"] = ports;
     }
+    for (const char* probe : {"livenessProbe", "readinessProbe", "startupProbe"}) {
+        if (container[probe].IsObject()) c[probe] = ProbeDefaults(container[probe]);
+    }
+    for (const char* hook : {"postStart", "preStop"}) {
+        if (container["lifecycle"][hook].IsObject()) c["lifecycle"][hook] = HandlerDefaults(container["lifecycle"][hook]);
+    }
+    if (container["env"].IsArray()) c["env"] = FieldRefDefaults(container["env"]);
     return c.ExtractValue();
 }
 
+json::Value VolumeDefaults(const json::Value& volume) {
+    json::ValueBuilder v(volume);
+    for (const char* source : {"configMap", "secret", "downwardAPI", "projected"}) {
+        if (volume[source].IsObject()) SetIfMissing(v[source], "defaultMode", 420);
+    }
+    if (volume["downwardAPI"]["items"].IsArray()) v["downwardAPI"]["items"] = FieldRefDefaults(volume["downwardAPI"]["items"]);
+    if (volume["hostPath"].IsObject()) SetIfMissing(v["hostPath"], "type", "");
+    if (volume["projected"]["sources"].IsArray()) {
+        json::ValueBuilder sources(json::Type::kArray);
+        for (const auto& src : volume["projected"]["sources"]) {
+            json::ValueBuilder sb(src);
+            if (src["serviceAccountToken"].IsObject()) SetIfMissing(sb["serviceAccountToken"], "expirationSeconds", 3600);
+            if (src["downwardAPI"]["items"].IsArray()) sb["downwardAPI"]["items"] = FieldRefDefaults(src["downwardAPI"]["items"]);
+            sources.PushBack(sb.ExtractValue());
+        }
+        v["projected"]["sources"] = sources;
+    }
+    return v.ExtractValue();
+}
+
 json::Value PodSpecDefaults(const json::Value& spec_value) {
-    json::ValueBuilder spec(spec_value.IsObject() ? spec_value : json::ValueBuilder(json::Type::kObject).ExtractValue());
+    json::ValueBuilder spec(Object(spec_value));
     SetIfMissing(spec, "restartPolicy", "Always");
     SetIfMissing(spec, "dnsPolicy", "ClusterFirst");
     SetIfMissing(spec, "schedulerName", "default-scheduler");
@@ -83,14 +170,39 @@ json::Value PodSpecDefaults(const json::Value& spec_value) {
     auto sa = spec_value["serviceAccountName"].As<std::string>(spec_value["serviceAccount"].As<std::string>("default"));
     spec["serviceAccountName"] = sa;
     spec["serviceAccount"] = sa;
-    SetIfMissing(spec, "priority", 0);
+    const bool host_network = spec_value["hostNetwork"].As<bool>(false);
     for (const char* list : {"containers", "initContainers", "ephemeralContainers"}) {
         if (!spec_value[list].IsArray()) continue;
         json::ValueBuilder out(json::Type::kArray);
-        for (const auto& c : spec_value[list]) out.PushBack(ContainerDefaults(c));
+        for (const auto& c : spec_value[list]) out.PushBack(ContainerDefaults(c, host_network));
         spec[list] = out;
     }
+    if (spec_value["volumes"].IsArray()) {
+        json::ValueBuilder out(json::Type::kArray);
+        for (const auto& v : spec_value["volumes"]) out.PushBack(VolumeDefaults(v));
+        spec["volumes"] = out;
+    }
     return spec.ExtractValue();
+}
+
+// The QoS class upstream gives a pod from its requests and limits.
+std::string QosClass(const json::Value& spec) {
+    bool any = false, guaranteed = true;
+    for (const char* list : {"initContainers", "containers"}) {
+        if (!spec[list].IsArray()) continue;
+        for (const auto& c : spec[list]) {
+            const auto requests = c["resources"]["requests"];
+            const auto limits = c["resources"]["limits"];
+            for (const char* res : {"cpu", "memory"}) {
+                bool has_request = requests.HasMember(res) && requests[res].As<std::string>("") != "0";
+                bool has_limit = limits.HasMember(res);
+                any = any || has_request || has_limit;
+                if (!has_limit || !has_request || requests[res] != limits[res]) guaranteed = false;
+            }
+        }
+    }
+    if (!any) return "BestEffort";
+    return guaranteed ? "Guaranteed" : "Burstable";
 }
 
 json::Value ServiceDefaults(const json::Value& object) {
@@ -163,6 +275,101 @@ Value Defaults(const Resource& r, Value object) {
             b["spec"]["template"]["spec"] = PodSpecDefaults(object["spec"]["template"]["spec"]);
         }
     }
+    if (r.group == "batch" && r.plural == "cronjobs" && object["spec"]["jobTemplate"]["spec"]["template"]["spec"].IsObject()) {
+        b["spec"]["jobTemplate"]["spec"]["template"]["spec"] = PodSpecDefaults(object["spec"]["jobTemplate"]["spec"]["template"]["spec"]);
+    }
+    if (r.group == "batch" && r.plural == "jobs") {
+        auto spec = b["spec"];
+        const auto in = object["spec"];
+        if (!in.HasMember("parallelism")) spec["parallelism"] = 1;
+        if (!in.HasMember("completions") && !in.HasMember("parallelism")) spec["completions"] = 1;
+        if (!in.HasMember("backoffLimit") && !in.HasMember("backoffLimitPerIndex")) spec["backoffLimit"] = 6;
+        SetIfMissing(spec, "completionMode", "NonIndexed");
+        SetIfMissing(spec, "suspend", false);
+        SetIfMissing(spec, "manualSelector", false);
+        if (!in.HasMember("podFailurePolicy")) SetIfMissing(spec, "podReplacementPolicy", "TerminatingOrFailed");
+    }
+    if (r.group == "batch" && r.plural == "cronjobs") {
+        auto spec = b["spec"];
+        SetIfMissing(spec, "concurrencyPolicy", "Allow");
+        SetIfMissing(spec, "suspend", false);
+        SetIfMissing(spec, "successfulJobsHistoryLimit", 3);
+        SetIfMissing(spec, "failedJobsHistoryLimit", 1);
+    }
+    if (r.group == "apps" && r.plural == "daemonsets") {
+        auto spec = b["spec"];
+        SetIfMissing(spec, "revisionHistoryLimit", 10);
+        const auto strategy = object["spec"]["updateStrategy"];
+        if (strategy["type"].As<std::string>("RollingUpdate") == "RollingUpdate") {
+            json::ValueBuilder st(Object(strategy));
+            st["type"] = "RollingUpdate";
+            if (strategy["rollingUpdate"]["maxUnavailable"].IsMissing()) st["rollingUpdate"]["maxUnavailable"] = 1;
+            if (strategy["rollingUpdate"]["maxSurge"].IsMissing()) st["rollingUpdate"]["maxSurge"] = 0;
+            spec["updateStrategy"] = st;
+        }
+    }
+    if (r.group == "apps" && r.plural == "statefulsets") {
+        auto spec = b["spec"];
+        SetIfMissing(spec, "replicas", 1);
+        SetIfMissing(spec, "revisionHistoryLimit", 10);
+        SetIfMissing(spec, "podManagementPolicy", "OrderedReady");
+        const auto strategy = object["spec"]["updateStrategy"];
+        if (strategy["type"].As<std::string>("RollingUpdate") == "RollingUpdate") {
+            json::ValueBuilder st(Object(strategy));
+            st["type"] = "RollingUpdate";
+            if (strategy["rollingUpdate"]["partition"].IsMissing()) st["rollingUpdate"]["partition"] = 0;
+            spec["updateStrategy"] = st;
+        }
+        json::ValueBuilder retention(Object(object["spec"]["persistentVolumeClaimRetentionPolicy"]));
+        SetIfMissing(retention, "whenDeleted", "Retain");
+        SetIfMissing(retention, "whenScaled", "Retain");
+        spec["persistentVolumeClaimRetentionPolicy"] = retention;
+        if (object["spec"]["volumeClaimTemplates"].IsArray()) {
+            json::ValueBuilder claims(json::Type::kArray);
+            for (const auto& c : object["spec"]["volumeClaimTemplates"]) {
+                json::ValueBuilder cb(c);
+                SetIfMissing(cb["spec"], "volumeMode", "Filesystem");
+                claims.PushBack(cb.ExtractValue());
+            }
+            spec["volumeClaimTemplates"] = claims;
+        }
+    }
+    if (r.group.empty() && r.plural == "replicationcontrollers") {
+        auto spec = b["spec"];
+        SetIfMissing(spec, "replicas", 1);
+        const auto labels = object["spec"]["template"]["metadata"]["labels"];
+        if (labels.IsObject()) {
+            if (!object["spec"].HasMember("selector")) spec["selector"] = labels;
+            if (!object["metadata"].HasMember("labels")) b["metadata"]["labels"] = labels;
+        }
+    }
+    if (r.group.empty() && r.plural == "persistentvolumeclaims") {
+        SetIfMissing(b["spec"], "volumeMode", "Filesystem");
+        if (!object["status"].HasMember("phase")) b["status"]["phase"] = "Pending";
+    }
+    if (r.group.empty() && r.plural == "persistentvolumes") {
+        SetIfMissing(b["spec"], "persistentVolumeReclaimPolicy", "Retain");
+        SetIfMissing(b["spec"], "volumeMode", "Filesystem");
+        if (!object["status"].HasMember("phase")) b["status"]["phase"] = "Pending";
+    }
+    if (r.group.empty() && r.plural == "secrets") SetIfMissing(b, "type", "Opaque");
+    if (r.group == "rbac.authorization.k8s.io" && object["subjects"].IsArray()) {
+        json::ValueBuilder subjects(json::Type::kArray);
+        for (const auto& sub : object["subjects"]) {
+            json::ValueBuilder sb(sub);
+            auto kind = sub["kind"].As<std::string>("");
+            SetIfMissing(sb, "apiGroup", kind == "ServiceAccount" ? "" : "rbac.authorization.k8s.io");
+            subjects.PushBack(sb.ExtractValue());
+        }
+        b["subjects"] = subjects;
+    }
+    if (r.group == "networking.k8s.io" && r.plural == "networkpolicies") {
+        if (!object["spec"].HasMember("policyTypes")) {
+            std::vector<std::string> types{"Ingress"};
+            if (object["spec"].HasMember("egress")) types.push_back("Egress");
+            b["spec"]["policyTypes"] = types;
+        }
+    }
     if (r.group == "apps" && r.plural == "deployments") {
         auto spec = b["spec"];
         SetIfMissing(spec, "replicas", 1);
@@ -209,8 +416,8 @@ Value PrepareCreate(const Resource& r, Value object, const std::string& ns) {
     auto generate = object["metadata"]["generateName"].As<std::string>("");
     if (name.empty() && !generate.empty()) name = generate + RandomSuffix();
     if (name.empty()) throw Invalid(r.kind, r.group, "", "metadata.name: Required value: name or generateName is required");
-    if (!ValidName(name)) {
-        throw Invalid(r.kind, r.group, name, "metadata.name: Invalid value: \"" + name + "\": a lowercase RFC 1123 subdomain must consist of lower case alphanumeric characters, '-' or '.'");
+    if (auto problem = NameProblem(r, name); !problem.empty()) {
+        throw Invalid(r.kind, r.group, name, "metadata.name: Invalid value: \"" + name + "\": " + problem);
     }
     meta["name"] = name;
     if (r.namespaced) {
@@ -227,11 +434,27 @@ Value PrepareCreate(const Resource& r, Value object, const std::string& ns) {
     if (meta.HasMember("resourceVersion")) meta.Remove("resourceVersion");
     if (meta.HasMember("deletionTimestamp")) meta.Remove("deletionTimestamp");
     if (r.has_status) meta["generation"] = 1;
+    if (r.group == "batch" && r.plural == "jobs" && !object["spec"]["manualSelector"].As<bool>(false)) {
+        // A job's pods are found by its uid, which nobody but the server knows.
+        const auto uid = meta["uid"].ExtractValue();
+        json::ValueBuilder labels(Object(object["spec"]["template"]["metadata"]["labels"]));
+        labels["batch.kubernetes.io/controller-uid"] = uid;
+        labels["batch.kubernetes.io/job-name"] = name;
+        labels["controller-uid"] = uid;
+        labels["job-name"] = name;
+        b["spec"]["template"]["metadata"]["labels"] = labels;
+        json::ValueBuilder selector(json::Type::kObject);
+        selector["matchLabels"]["batch.kubernetes.io/controller-uid"] = uid;
+        b["spec"]["selector"] = selector;
+    }
     if (r.group.empty() && r.plural == "pods") {
         json::ValueBuilder status(json::Type::kObject);
         status["phase"] = "Pending";
-        status["qosClass"] = "BestEffort";
         b["status"] = status;
+        auto defaulted = Defaults(r, b.ExtractValue());
+        json::ValueBuilder withQos(defaulted);
+        withQos["status"]["qosClass"] = QosClass(defaulted["spec"]);
+        return withQos.ExtractValue();
     }
     return Defaults(r, b.ExtractValue());
 }

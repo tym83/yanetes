@@ -32,6 +32,9 @@ std::atomic<const Decoder*> g_instance{nullptr};
 // *string set to "" just as it writes an empty string, and only for these
 // "" means something (storageClassName "" turns provisioning off).
 std::unordered_set<std::string> g_pointer_strings;
+// Embedded structs JSON inlines and protobuf keeps as fields of their own:
+// a Volume's VolumeSource, a Probe's handler.
+std::unordered_set<std::string> g_inline_fields;
 
 class Errors final : public pb::compiler::MultiFileErrorCollector {
 public:
@@ -147,6 +150,12 @@ json::Value Convert(const pb::Message& m) {
             json::ValueBuilder list(json::Type::kArray);
             for (int i = 0; i < r->FieldSize(m, f); ++i) list.PushBack(Scalar(m, r, f, i));
             out[std::string(f->name())] = list;
+        } else if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE &&
+                   g_inline_fields.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
+            auto v = Scalar(m, r, f, -1);
+            if (v.IsObject()) {
+                for (auto it = v.begin(); it != v.end(); ++it) out[it.GetName()] = *it;
+            }
         } else {
             auto v = Scalar(m, r, f, -1);
             // Go writes every plain string field, JSON omits the empty ones:
@@ -193,12 +202,14 @@ Decoder::Decoder(const std::string& proto_dir) : impl_(std::make_unique<Impl>())
         auto rel = std::filesystem::relative(entry.path(), proto_dir).string();
         if (impl_->importer.Import(rel)) ++loaded;
     }
-    std::ifstream pointers(proto_dir + "/pointer-strings.txt");
-    for (std::string line; std::getline(pointers, line);) {
-        if (!line.empty()) g_pointer_strings.insert(line);
+    for (auto [file, set] : {std::pair{"/pointer-strings.txt", &g_pointer_strings}, std::pair{"/inline-fields.txt", &g_inline_fields}}) {
+        std::ifstream in(proto_dir + file);
+        for (std::string line; std::getline(in, line);) {
+            if (!line.empty()) set->insert(line);
+        }
     }
     LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir << ", " << g_pointer_strings.size()
-               << " pointer string fields";
+               << " pointer string fields, " << g_inline_fields.size() << " inline fields";
 }
 
 Decoder::~Decoder() = default;
