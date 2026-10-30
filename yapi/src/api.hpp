@@ -18,6 +18,7 @@ class Connection;
 class Auth;
 class Crds;
 class Webhooks;
+class Policies;
 class Services;
 class Store;
 class Watch;
@@ -49,6 +50,7 @@ public:
 
 private:
     std::string Handle(const userver::server::http::HttpRequest& request) const;
+    std::string HandleInner(const userver::server::http::HttpRequest& request) const;
     // Reviews and the like: answered, not stored.
     std::string Review(const Resource& r, const userver::server::http::HttpRequest& request, const User& user) const;
     std::string Proxy(const userver::server::http::HttpRequest& request, const Resource& r, const std::string& ns,
@@ -63,6 +65,7 @@ private:
     // Prunes and checks fields as the request's fieldValidation asks.
     userver::formats::json::Value CheckFields(const Resource& r, const userver::formats::json::Value& object,
                                               const std::string& body, const userver::server::http::HttpRequest& request) const;
+    void Warn(const userver::server::http::HttpRequest& request, const std::vector<std::string>& warnings) const;
     void Bind(const std::string& ns, const std::string& name, const std::string& node) const;
     void Evict(const std::string& ns, const std::string& name, const userver::formats::json::Value& options) const;
     std::string TokenRequest(const std::string& ns, const std::string& name, const userver::server::http::HttpRequest& request) const;
@@ -73,6 +76,7 @@ private:
     Services& services_;
     Crds& crds_;
     Webhooks& webhooks_;
+    Policies& policies_;
     userver::clients::http::Client& http_;
     const Registry& registry_;
     std::string openapi_dir_;

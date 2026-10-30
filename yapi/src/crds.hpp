@@ -34,6 +34,11 @@ public:
     // resource's structural schema, or a built-in type's OpenAPI one.
     std::optional<schema::Schema> SchemaFor(const Resource& r) const;
 
+    // The raw root schema of a resource and the OpenAPI components its
+    // $refs point into, for the CEL type checker.
+    userver::formats::json::Value RootSchema(const Resource& r) const;
+    const std::map<std::string, userver::formats::json::Value>* Components() const { return &components_; }
+
     // Checks a definition before it is stored; throws ApiError.
     static void Validate(const userver::formats::json::Value& crd);
 

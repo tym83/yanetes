@@ -5,7 +5,9 @@
 //     *bool, ...), where "", 0 and false are values: protobuf writes every
 //     other scalar even when it is zero, where JSON leaves it out;
 //   - inline-fields.txt: embedded structs JSON inlines (Volume's
-//     VolumeSource), which protobuf keeps as a field of their own.
+//     VolumeSource), which protobuf keeps as a field of their own;
+//   - renamed-fields.txt: "message.field jsonName" where the protobuf name
+//     is not the JSON one (admissionregistration's "Webhooks").
 //
 //	go run ./hack/protohints <proto-dir> \
 //	  $(go list -m -f '{{.Dir}}' k8s.io/api)=k8s.io.api \
@@ -41,7 +43,7 @@ func protoName(tag *ast.BasicLit) string {
 
 func main() {
 	out := os.Args[1]
-	var pointers, inlines []string
+	var pointers, inlines, renames []string
 	for _, arg := range os.Args[2:] {
 		root, prefix, _ := strings.Cut(arg, "=")
 		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
@@ -77,6 +79,9 @@ func main() {
 						inlines = append(inlines, pkg+"."+ts.Name.Name+"."+name)
 						continue
 					}
+					if jsonName != "" && jsonName != "-" && jsonName != name {
+						renames = append(renames, pkg+"."+ts.Name.Name+"."+name+" "+jsonName)
+					}
 					if star, ok := field.Type.(*ast.StarExpr); ok {
 						if id, ok := star.X.(*ast.Ident); ok && scalar[id.Name] {
 							pointers = append(pointers, pkg+"."+ts.Name.Name+"."+name)
@@ -96,4 +101,5 @@ func main() {
 	}
 	write("pointer-fields.txt", pointers)
 	write("inline-fields.txt", inlines)
+	write("renamed-fields.txt", renames)
 }

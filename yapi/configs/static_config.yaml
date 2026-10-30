@@ -75,9 +75,10 @@ components_manager:
         http-client-core:
             fs-task-processor: fs-task-processor
             user-agent: yapi
-            dns_resolver: async
+            dns_resolver: getaddrinfo
         http-client: {}
         yapi-webhooks: {}
+        yapi-policies: {}
         yapi-protobuf:
             proto-dir: $proto-dir
             proto-dir#fallback: /usr/share/yapi/proto

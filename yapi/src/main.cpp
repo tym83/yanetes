@@ -14,6 +14,7 @@
 #include <api.hpp>
 #include <auth.hpp>
 #include <crds.hpp>
+#include <policies.hpp>
 #include <webhooks.hpp>
 #include <objects.hpp>
 #include <proto.hpp>
@@ -102,6 +103,7 @@ int main(int argc, char* argv[]) {
                     .Append<userver::clients::dns::Component>()
                     .AppendComponentList(userver::clients::http::ComponentList())
                     .Append<yapi::Webhooks>()
+                    .Append<yapi::Policies>()
                     .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.
     for (const char* name : {"api-0", "api-1", "api-2", "api-3", "api-4", "api-5", "api-6", "api-7", "api-8",

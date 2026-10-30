@@ -4,6 +4,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <google/protobuf/compiler/importer.h>
@@ -36,6 +37,13 @@ std::unordered_set<std::string> g_pointer_fields;
 // Embedded structs JSON inlines and protobuf keeps as fields of their own:
 // a Volume's VolumeSource, a Probe's handler.
 std::unordered_set<std::string> g_inline_fields;
+// Protobuf field names that are not the JSON ones, message.field -> name.
+std::unordered_map<std::string, std::string> g_renamed_fields;
+
+std::string JsonName(const pb::Descriptor* d, const pb::FieldDescriptor* f) {
+    auto it = g_renamed_fields.find(std::string(d->full_name()) + "." + std::string(f->name()));
+    return it == g_renamed_fields.end() ? std::string(f->name()) : it->second;
+}
 
 class Errors final : public pb::compiler::MultiFileErrorCollector {
 public:
@@ -146,11 +154,11 @@ json::Value Convert(const pb::Message& m) {
                 map[k.IsString() ? k.As<std::string>() : json::ToString(k)] =
                     Scalar(entry, entry.GetReflection(), value, -1);
             }
-            out[std::string(f->name())] = map;
+            out[JsonName(d, f)] = map;
         } else if (f->is_repeated()) {
             json::ValueBuilder list(json::Type::kArray);
             for (int i = 0; i < r->FieldSize(m, f); ++i) list.PushBack(Scalar(m, r, f, i));
-            out[std::string(f->name())] = list;
+            out[JsonName(d, f)] = list;
         } else if (f->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE &&
                    g_inline_fields.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
             auto v = Scalar(m, r, f, -1);
@@ -168,7 +176,7 @@ json::Value Convert(const pb::Message& m) {
                 !g_pointer_fields.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
                 continue;
             }
-            if (!v.IsNull() && !v.IsMissing()) out[std::string(f->name())] = v;
+            if (!v.IsNull() && !v.IsMissing()) out[JsonName(d, f)] = v;
         }
     }
     return out.ExtractValue();
@@ -211,6 +219,11 @@ Decoder::Decoder(const std::string& proto_dir) : impl_(std::make_unique<Impl>())
         for (std::string line; std::getline(in, line);) {
             if (!line.empty()) set->insert(line);
         }
+    }
+    std::ifstream renames(proto_dir + "/renamed-fields.txt");
+    for (std::string line; std::getline(renames, line);) {
+        auto sp = line.find(' ');
+        if (sp != std::string::npos) g_renamed_fields[line.substr(0, sp)] = line.substr(sp + 1);
     }
     LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir << ", " << g_pointer_fields.size()
                << " pointer fields, " << g_inline_fields.size() << " inline fields";

@@ -4,6 +4,7 @@
 
 #include <userver/clients/http/component.hpp>
 #include <userver/clients/http/connect_to.hpp>
+#include <userver/clients/http/error.hpp>
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/crypto/base64.hpp>
@@ -16,6 +17,7 @@
 #include <userver/utils/uuid4.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
 
+#include <cel.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
 #include <status.hpp>
@@ -178,7 +180,72 @@ bool Webhooks::Matches(const Hook& hook, const Request& req) const {
         any = any || (req.old_object.IsObject() && SelectorMatches(obj_selector, req.old_object["metadata"]["labels"]));
         if (!any) return false;
     }
+    // Match conditions last: all must hold. An error goes by the failure policy.
+    const auto conditions = hook.spec["matchConditions"];
+    if (conditions.IsArray() && !conditions.IsEmpty()) {
+        cel::Activation a;
+        a.vars["object"] = req.object.IsObject() ? req.object : Value();
+        a.vars["oldObject"] = req.old_object.IsObject() ? req.old_object : Value();
+        ValueBuilder rq(json::Type::kObject);
+        rq["operation"] = req.operation;
+        rq["name"] = req.name;
+        rq["namespace"] = req.ns;
+        rq["subResource"] = req.subresource;
+        rq["resource"]["group"] = r.group;
+        rq["resource"]["version"] = r.version;
+        rq["resource"]["resource"] = r.plural;
+        rq["kind"]["group"] = r.group;
+        rq["kind"]["version"] = r.version;
+        rq["kind"]["kind"] = r.kind;
+        if (req.user) rq["userInfo"] = req.user->ToJson();
+        rq["dryRun"] = req.dry_run;
+        a.vars["request"] = rq.ExtractValue();
+        for (const auto& cond : conditions) {
+            try {
+                auto v = cel::Program::Parse(cond["expression"].As<std::string>("")).Eval(a);
+                if (!v.IsBool() || !v.As<bool>()) return false;
+            } catch (const std::exception& e) {
+                if (hook.spec["failurePolicy"].As<std::string>("Fail") == "Ignore") return false;
+                throw ApiError(500, "InternalError", "Internal error occurred: failed calling webhook \"" + hook.name +
+                                                         "\": match condition " + cond["name"].As<std::string>("") + " failed: " + e.what());
+            }
+        }
+    }
     return true;
+}
+
+namespace {
+
+cel::Env ConditionEnv() {
+    cel::Env env;
+    for (const char* v : {"object", "oldObject", "request", "authorizer", "params"}) env.vars[v] = cel::Type::Dyn();
+    return env;
+}
+
+}  // namespace
+
+void Webhooks::ValidateConfig(const Resource& r, const Value& config) {
+    std::size_t i = 0;
+    for (const auto& hook : objects::Items(config["webhooks"])) {
+        std::size_t j = 0;
+        for (const auto& cond : objects::Items(hook["matchConditions"])) {
+            const auto expr = cond["expression"].As<std::string>("");
+            const auto field = "webhooks[" + std::to_string(i) + "].matchConditions[" + std::to_string(j) + "].expression";
+            std::string error;
+            try {
+                auto errs = cel::Program::Parse(expr).Check(ConditionEnv());
+                if (!errs.empty()) error = errs[0];
+            } catch (const cel::CompileError& e) {
+                error = e.what();
+            }
+            if (!error.empty()) {
+                throw Invalid(r.kind, r.group, objects::Name(config),
+                              field + ": Invalid value: \"" + expr + "\": compilation failed: " + error);
+            }
+            ++j;
+        }
+        ++i;
+    }
 }
 
 Value Webhooks::Call(const Value& cc, const std::string& name, const Value& body, int timeout_seconds) const {
@@ -206,7 +273,15 @@ Value Webhooks::Call(const Value& cc, const std::string& name, const Value& body
     auto ca = cc["caBundle"].As<std::string>("");
     if (!ca.empty()) request.ca(userver::crypto::Certificate::LoadFromString(userver::crypto::base64::Base64Decode(ca)));
     if (connect_to) request.connect_to(*connect_to);
-    auto response = request.perform();
+    std::shared_ptr<userver::clients::http::Response> response;
+    try {
+        response = request.perform();
+    } catch (const userver::clients::http::TimeoutException&) {
+        // Said the way Go's client says it: callers look for "deadline".
+        throw std::runtime_error("Post \"" + url + "?timeout=" + std::to_string(timeout_seconds) + "s\": context deadline exceeded");
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Post \"" + url + "?timeout=" + std::to_string(timeout_seconds) + "s\": " + e.what());
+    }
     if (response->status_code() != userver::clients::http::Status::kOk) {
         throw std::runtime_error("the server responded with status " + std::to_string(static_cast<int>(response->status_code())));
     }
@@ -263,14 +338,17 @@ Value Webhooks::Review(const Hook& hook, const Request& req, const Value& object
 namespace {
 
 void Refuse(const std::string& hook, const Value& response) {
+    // As upstream's ToStatusErr: never under 400, the reason when there is
+    // no message.
     const auto status = response["status"];
+    auto code = status["code"].As<int>(0);
+    if (code < 400) code = 400;
+    const auto denied = "admission webhook \"" + hook + "\" denied the request";
     auto message = status["message"].As<std::string>("");
-    auto code = status["code"].As<int>(403);
-    if (code < 400) code = 403;
-    auto reason = status["reason"].As<std::string>(code == 403 ? "Forbidden" : "BadRequest");
-    throw ApiError(code, reason,
-                   "admission webhook \"" + hook + "\" denied the request" +
-                       (message.empty() ? std::string(" without explanation") : ": " + message));
+    auto reason = status["reason"].As<std::string>("");
+    throw ApiError(code, reason, !message.empty() ? denied + ": " + message
+                                 : !reason.empty() ? denied + ": " + reason
+                                                   : denied + " without explanation");
 }
 
 }  // namespace

@@ -54,6 +54,14 @@ public:
         const std::string& desired_api_version
     ) const;
 
+    // Checks a webhook configuration before it is stored: match conditions
+    // must compile. Throws ApiError.
+    static void ValidateConfig(const Resource& r, const userver::formats::json::Value& config);
+
+    // Rereads the configurations now, after this server wrote one: a
+    // client that just registered a webhook expects it to apply.
+    void Refresh();
+
 private:
     struct Hook {
         std::string name;
@@ -63,7 +71,6 @@ private:
         std::vector<Hook> mutating, validating;
     };
 
-    void Refresh();
     void Run();
     bool Matches(const Hook& hook, const Request& request) const;
     userver::formats::json::Value Call(

@@ -30,6 +30,8 @@ add_library(yapi_objs OBJECT
     src/webhooks.cpp
     src/quantity.cpp
     src/openapi.cpp
+    src/cel.cpp
+    src/policies.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)
@@ -43,6 +45,7 @@ add_executable(yapi_unittest
     src/selectors_test.cpp
     src/objects_test.cpp
     src/patch_test.cpp
+    src/cel_test.cpp
 )
 target_link_libraries(yapi_unittest PRIVATE yapi_objs userver::utest)
 add_google_tests(yapi_unittest)

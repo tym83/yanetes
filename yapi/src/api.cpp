@@ -38,6 +38,7 @@
 #include <status.hpp>
 #include <store.hpp>
 #include <tables.hpp>
+#include <policies.hpp>
 #include <webhooks.hpp>
 #include <watch.hpp>
 
@@ -78,6 +79,9 @@ std::vector<std::string> Verbs(const Resource& r) {
 bool IsServiceAccount(const Resource& r) { return r.group.empty() && r.plural == "serviceaccounts"; }
 bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
 bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
+bool IsWebhookConfig(const Resource& r) {
+    return r.group == "admissionregistration.k8s.io" && (r.plural == "validatingwebhookconfigurations" || r.plural == "mutatingwebhookconfigurations");
+}
 bool IsDefinitions(const Resource& r) { return r.group == "apiextensions.k8s.io" && r.plural == "customresourcedefinitions"; }
 bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
 // Pod subresources served by the pod's kubelet.
@@ -378,6 +382,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       services_(context.FindComponent<Services>()),
       crds_(context.FindComponent<Crds>()),
       webhooks_(context.FindComponent<Webhooks>()),
+      policies_(context.FindComponent<Policies>()),
       http_(context.FindComponent<userver::components::HttpClient>().GetHttpClient()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
@@ -416,6 +421,22 @@ std::string Api::HandleRequestThrow(const http::HttpRequest& request, userver::s
 }
 
 std::string Api::Handle(const http::HttpRequest& request) const {
+    auto out = HandleInner(request);
+    const auto method = request.GetMethod();
+    if (method != http::HttpMethod::kGet && method != http::HttpMethod::kHead &&
+        request.GetRequestPath().find("/apis/admissionregistration.k8s.io/") == 0 &&
+        request.GetRequestPath().find("webhookconfigurations") != std::string::npos) {
+        webhooks_.Refresh();
+    }
+    if (method != http::HttpMethod::kGet && method != http::HttpMethod::kHead &&
+        request.GetRequestPath().find("/apis/admissionregistration.k8s.io/") == 0 &&
+        request.GetRequestPath().find("admissionpolic") != std::string::npos) {
+        policies_.Refresh();
+    }
+    return out;
+}
+
+std::string Api::HandleInner(const http::HttpRequest& request) const {
     const auto parts = Split(request.GetRequestPath());
     const auto method = request.GetMethod();
     auto& response = request.GetHttpResponse();
@@ -628,6 +649,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             if (r.namespaced && t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
             auto object = objects::PrepareCreate(r, incoming, t.ns);
             if (IsDefinitions(r)) Crds::Validate(object);
+            if (IsWebhookConfig(r)) Webhooks::ValidateConfig(r, object);
             auto name = objects::Name(object);
             if (r.namespaced) {
                 auto ns = store_.Get(kNamespaces, "", t.ns);
@@ -640,8 +662,12 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             object = admission::Admit(store_, r, object);
             {
                 Webhooks::Request wr{&r, "", "CREATE", t.ns, name, object, Value(), Value(), &*user, dry_run};
-                object = webhooks_.Mutate(wr);
+                // Policies, then webhooks; a mutation is defaulted again, as
+                // the decoder upstream does.
+                wr.object = policies_.Mutate(wr);
+                object = objects::Defaults(r, webhooks_.Mutate(wr));
                 wr.object = object;
+                Warn(request, policies_.Validate(wr));
                 webhooks_.Validate(wr);
             }
             object = ToStorage(r, object);
@@ -752,8 +778,19 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 if (!current) throw NotFound(r.plural, r.group, t.name);
                 incoming = patch::Apply(content_type, *current, body);
                 // A patch writes on top of what it read: no version check unless it set one.
-                auto asked = patch::Apply(content_type, ValueBuilder(json::Type::kObject).ExtractValue(), body);
-                if (asked["metadata"]["resourceVersion"].IsMissing()) {
+                // Whether the patch itself names a version: a merge patch says
+                // so by its keys, a JSON patch by its paths.
+                bool asked_rv = false;
+                try {
+                    auto p = json::FromString(body);
+                    if (p.IsArray()) {
+                        for (const auto& op : p) asked_rv = asked_rv || op["path"].As<std::string>("") == "/metadata/resourceVersion";
+                    } else {
+                        asked_rv = p["metadata"].HasMember("resourceVersion");
+                    }
+                } catch (const std::exception&) {
+                }
+                if (!asked_rv) {
                     ValueBuilder b(incoming);
                     b["metadata"]["resourceVersion"] = (*current)["metadata"]["resourceVersion"];
                     incoming = b.ExtractValue();
@@ -805,13 +842,15 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             } else {
                 next = objects::PrepareUpdate(r, *current, incoming, status_write);
                 if (IsDefinitions(r) && !status_write) Crds::Validate(next);
+                if (IsWebhookConfig(r)) Webhooks::ValidateConfig(r, next);
                 if (IsService(r) && !status_write && !dry_run) next = services_.Assign(next, current, change);
             }
             next = ToStorage(r, next);
             if (next == *stored) return Decision::Keep();
             return Releasable(r, next) ? Decision::Remove(next) : Decision::Put(next);
         };
-        if (webhooks_.Interested(r, t.sub, "UPDATE") || webhooks_.Interested(r, t.sub, "CREATE")) {
+        if (webhooks_.Interested(r, t.sub, "UPDATE") || webhooks_.Interested(r, t.sub, "CREATE") ||
+            policies_.Interested(r, "UPDATE") || policies_.Interested(r, "CREATE")) {
             // Webhooks are called outside the store's transaction: read,
             // decide, ask them, then write only if nobody wrote in between.
             for (int attempt = 0; attempt < 8; ++attempt) {
@@ -820,8 +859,10 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 if (d.action == Decision::Action::kKeep) return json::ToString(ToView(r, stored ? *stored : d.object));
                 Webhooks::Request wr{&r, t.sub, stored ? "UPDATE" : "CREATE", t.ns, t.name, ToView(r, d.object),
                                      stored ? ToView(r, *stored) : Value(), Value(), &*user, dry_run};
-                auto mutated = webhooks_.Mutate(wr);
+                wr.object = policies_.Mutate(wr);
+                auto mutated = objects::Defaults(r, webhooks_.Mutate(wr));
                 wr.object = mutated;
+                Warn(request, policies_.Validate(wr));
                 webhooks_.Validate(wr);
                 if (dry_run) return json::ToString(mutated);
                 auto final_object = ToStorage(r, mutated);
@@ -867,10 +908,12 @@ std::string Api::Handle(const http::HttpRequest& request) const {
 
     if (method == http::HttpMethod::kDelete) {
         auto options = ParseBody(request.RequestBody());
-        if (webhooks_.Interested(r, t.sub, "DELETE")) {
+        if (webhooks_.Interested(r, t.sub, "DELETE") || policies_.Interested(r, "DELETE")) {
             auto stored = store_.Get(r, t.ns, t.name);
             if (!stored) throw NotFound(r.plural, r.group, t.name);
-            webhooks_.Validate({&r, t.sub, "DELETE", t.ns, t.name, Value(), ToView(r, *stored), options, &*user, dry_run});
+            Webhooks::Request wr{&r, t.sub, "DELETE", t.ns, t.name, Value(), ToView(r, *stored), options, &*user, dry_run};
+            Warn(request, policies_.Validate(wr));
+            webhooks_.Validate(wr);
         }
         auto decide = [&](const std::optional<Value>& current) -> Decision {
             if (!current) throw NotFound(r.plural, r.group, t.name);
@@ -1082,6 +1125,17 @@ std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns
     return body;
 }
 
+void Api::Warn(const http::HttpRequest& request, const std::vector<std::string>& warnings) const {
+    if (warnings.empty()) return;
+    std::string header;
+    for (const auto& w : warnings) {
+        std::string quoted;
+        for (char c : w) quoted += c == '"' ? std::string("\\\"") : std::string(1, c);
+        header += (header.empty() ? "" : ", ") + std::string("299 - \"") + quoted + "\"";
+    }
+    request.GetHttpResponse().SetHeader(std::string("Warning"), header);
+}
+
 Value Api::ToView(const Resource& r, const Value& object) const {
     if (!r.custom || !object.IsObject() || object["apiVersion"].As<std::string>("") == r.GroupVersion()) return object;
     if (r.custom->webhook_conversion) return webhooks_.Convert(*r.custom, {object}, r.GroupVersion()).front();
@@ -1218,7 +1272,10 @@ std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, cons
     auto& response = request.GetHttpResponse();
     response.SetStatus(static_cast<http::HttpStatus>(static_cast<int>(answer->status_code())));
     for (const auto& [k, v] : answer->headers()) {
-        if (k == "Content-Length" || k == "Transfer-Encoding" || k == "Connection") continue;
+        // The client library already unpacked the body.
+        std::string lower(k);
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == "content-length" || lower == "transfer-encoding" || lower == "connection" || lower == "content-encoding") continue;
         response.SetHeader(std::string(k), v);
     }
     return answer->body();

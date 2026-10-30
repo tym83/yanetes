@@ -305,6 +305,12 @@ std::optional<schema::Schema> Crds::SchemaFor(const Resource& r) const {
     return schema::Schema(components_.at(it->second), &components_);
 }
 
+Value Crds::RootSchema(const Resource& r) const {
+    if (r.custom) return r.custom->schema;
+    auto it = typed_.find(r.group + "/" + r.version + "/" + r.kind);
+    return it == typed_.end() ? Value() : components_.at(it->second);
+}
+
 Value Crds::Convert(const Resource& r, const Value& object, const std::string& version) const {
     if (!object.IsObject()) return object;
     ValueBuilder b(object);
