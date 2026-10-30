@@ -57,7 +57,8 @@ std::string Rfc3339(std::int64_t seconds, std::int32_t nanos, bool micro) {
     std::tm tm{};
     gmtime_r(&t, &tm);
     char buf[40];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tm);
+    // Years are four digits even before 1000, as Go writes them.
+    std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
     std::string out = buf;
     if (micro) {
         char frac[16];

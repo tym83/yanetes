@@ -37,6 +37,8 @@ bool DnsSubdomain(const std::string& name, std::size_t max = 253, bool dots = tr
 // Names the way upstream validates them per kind; an empty string when
 // the name will do, else what is wrong with it.
 std::string NameProblem(const Resource& r, const std::string& name) {
+    // An IP address names itself; validation checks it is one.
+    if (r.group == "networking.k8s.io" && r.plural == "ipaddresses") return "";
     if (r.group == "rbac.authorization.k8s.io") {
         if (name == "." || name == "..") return "may not be '" + name + "'";
         if (name.find('/') != std::string::npos) return "may not contain '/'";
@@ -213,6 +215,10 @@ json::Value ServiceDefaults(const json::Value& object) {
     auto type = in["type"].As<std::string>("ClusterIP");
     spec["type"] = type;
     SetIfMissing(spec, "sessionAffinity", "None");
+    if (in["sessionAffinity"].As<std::string>("") == "ClientIP" &&
+        in["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"].IsMissing()) {
+        spec["sessionAffinityConfig"]["clientIP"]["timeoutSeconds"] = 10800;
+    }
     if (in["ports"].IsArray()) {
         json::ValueBuilder ports(json::Type::kArray);
         for (const auto& p : in["ports"]) {
@@ -371,7 +377,15 @@ Value Defaults(const Resource& r, Value object) {
                 if (!ib.HasMember("default")) ib["default"] = json::ValueBuilder(json::Type::kObject);
                 if (!ib.HasMember("defaultRequest")) ib["defaultRequest"] = json::ValueBuilder(json::Type::kObject);
                 fill("default", item["max"]);
-                fill("defaultRequest", ib["default"].ExtractValue());
+                // The default limit as filled so far, read from a copy: a
+                // child builder cannot hand out its value.
+                json::ValueBuilder defaults(item["default"].IsObject() ? item["default"] : json::ValueBuilder(json::Type::kObject).ExtractValue());
+                if (item["max"].IsObject()) {
+                    for (auto it = item["max"].begin(); it != item["max"].end(); ++it) {
+                        if (!defaults.HasMember(it.GetName())) defaults[it.GetName()] = *it;
+                    }
+                }
+                fill("defaultRequest", defaults.ExtractValue());
                 fill("defaultRequest", item["min"]);
             }
             limits.PushBack(ib.ExtractValue());

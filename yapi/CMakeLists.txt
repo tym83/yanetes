@@ -32,11 +32,13 @@ add_library(yapi_objs OBJECT
     src/openapi.cpp
     src/cel.cpp
     src/policies.cpp
+    src/bodies.cpp
+    src/validation.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)
 find_package(OpenSSL REQUIRED)
-target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb protobuf::libprotoc protobuf::libprotobuf OpenSSL::Crypto)
+target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb protobuf::libprotoc protobuf::libprotobuf OpenSSL::Crypto yaml-cpp)
 
 add_executable(yapi src/main.cpp)
 target_link_libraries(yapi PRIVATE yapi_objs)

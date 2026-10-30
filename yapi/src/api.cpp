@@ -26,6 +26,7 @@
 
 #include <admission.hpp>
 #include <auth.hpp>
+#include <bodies.hpp>
 #include <crds.hpp>
 #include <kubelet.hpp>
 #include <objects.hpp>
@@ -38,6 +39,7 @@
 #include <status.hpp>
 #include <store.hpp>
 #include <tables.hpp>
+#include <validation.hpp>
 #include <policies.hpp>
 #include <webhooks.hpp>
 #include <watch.hpp>
@@ -229,6 +231,90 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
     return b.ExtractValue();
 }
 
+// Aggregated discovery (apidiscovery.k8s.io/v2): every group with its
+// versions and resources in one document, built from the per-version lists.
+Value AggregatedDiscovery(const Registry& reg, bool core) {
+    std::vector<std::string> groups;
+    if (core) {
+        groups.push_back("");
+    } else {
+        for (const auto& gv : reg.GroupVersions()) {
+            auto g = gv.substr(0, gv.find('/'));
+            if (std::find(groups.begin(), groups.end(), g) == groups.end()) groups.push_back(g);
+        }
+    }
+    ValueBuilder items(json::Type::kArray);
+    for (const auto& g : groups) {
+        ValueBuilder entry(json::Type::kObject);
+        entry["metadata"]["name"] = g;
+        ValueBuilder versions(json::Type::kArray);
+        std::vector<std::string> vs;
+        if (core) {
+            vs.push_back("v1");
+        } else {
+            auto preferred = reg.PreferredVersion(g);
+            vs.push_back(preferred);
+            for (const auto& gv : reg.GroupVersions()) {
+                if (gv.starts_with(g + "/") && gv.substr(g.size() + 1) != preferred) vs.push_back(gv.substr(g.size() + 1));
+            }
+        }
+        for (const auto& v : vs) {
+            const auto list = ResourceList(reg, g.empty() ? v : g + "/" + v);
+            std::map<std::string, ValueBuilder> resources;
+            std::vector<std::string> order;
+            for (const auto& item : list["resources"]) {
+                auto name = item["name"].As<std::string>("");
+                auto slash = name.find('/');
+                ValueBuilder kind(json::Type::kObject);
+                kind["group"] = item.HasMember("group") ? item["group"] : ValueBuilder(g).ExtractValue();
+                kind["version"] = item.HasMember("version") ? item["version"] : ValueBuilder(v).ExtractValue();
+                kind["kind"] = item["kind"];
+                if (slash == std::string::npos) {
+                    ValueBuilder res(json::Type::kObject);
+                    res["resource"] = name;
+                    res["responseKind"] = kind;
+                    res["scope"] = item["namespaced"].As<bool>(false) ? "Namespaced" : "Cluster";
+                    res["singularResource"] = item["singularName"];
+                    res["verbs"] = item["verbs"];
+                    if (item.HasMember("shortNames")) res["shortNames"] = item["shortNames"];
+                    if (item.HasMember("categories")) res["categories"] = item["categories"];
+                    resources.emplace(name, std::move(res));
+                    order.push_back(name);
+                } else {
+                    auto parent = name.substr(0, slash);
+                    auto it = resources.find(parent);
+                    if (it == resources.end()) continue;
+                    ValueBuilder sub(json::Type::kObject);
+                    sub["subresource"] = name.substr(slash + 1);
+                    sub["responseKind"] = kind;
+                    sub["verbs"] = item["verbs"];
+                    if (!it->second.HasMember("subresources")) it->second["subresources"] = ValueBuilder(json::Type::kArray);
+                    it->second["subresources"].PushBack(sub.ExtractValue());
+                }
+            }
+            ValueBuilder version(json::Type::kObject);
+            version["version"] = v;
+            ValueBuilder rs(json::Type::kArray);
+            for (const auto& n : order) rs.PushBack(resources.at(n).ExtractValue());
+            version["resources"] = rs;
+            version["freshness"] = "Current";
+            versions.PushBack(version.ExtractValue());
+        }
+        entry["versions"] = versions;
+        items.PushBack(entry.ExtractValue());
+    }
+    ValueBuilder doc(json::Type::kObject);
+    doc["kind"] = "APIGroupDiscoveryList";
+    doc["apiVersion"] = "apidiscovery.k8s.io/v2";
+    doc["metadata"] = ValueBuilder(json::Type::kObject);
+    doc["items"] = items;
+    return doc.ExtractValue();
+}
+
+bool WantsAggregated(const http::HttpRequest& request) {
+    return request.GetHeader("Accept").find("as=APIGroupDiscoveryList") != std::string::npos;
+}
+
 Value Group(const Registry& reg, const std::string& name) {
     ValueBuilder g(json::Type::kObject);
     g["name"] = name;
@@ -271,21 +357,33 @@ bool Flag(const http::HttpRequest& req, std::string_view name) {
     return v == "true" || v == "1";
 }
 
-std::string EncodeContinue(const std::string& ns, const std::string& name) {
-    return userver::crypto::base64::Base64Encode(ns + '\n' + name, userver::crypto::base64::Pad::kWithout);
+// A continue token: where the next page starts and the revision the
+// list was read at, so every page reports the same one. -1 is upstream's
+// "inconsistent": continue at the current revision.
+struct Continue {
+    std::int64_t rv = 0;
+    std::string ns, name;
+};
+
+std::string EncodeContinue(std::int64_t rv, const std::string& ns, const std::string& name) {
+    ValueBuilder b(json::Type::kObject);
+    b["v"] = "meta.k8s.io/v1";
+    b["rv"] = rv;
+    b["start"] = ns + "/" + name;
+    return userver::crypto::base64::Base64UrlEncode(json::ToString(b.ExtractValue()), userver::crypto::base64::Pad::kWithout);
 }
 
-std::pair<std::string, std::string> DecodeContinue(const std::string& token) {
+Continue DecodeContinue(const std::string& token) {
     if (token.empty()) return {};
-    std::string raw;
     try {
-        raw = userver::crypto::base64::Base64Decode(token);
+        auto v = json::FromString(userver::crypto::base64::Base64UrlDecode(token));
+        auto start = v["start"].As<std::string>();
+        auto slash = start.find('/');
+        if (slash == std::string::npos) throw std::runtime_error("no start");
+        return {v["rv"].As<std::int64_t>(), start.substr(0, slash), start.substr(slash + 1)};
     } catch (const std::exception&) {
-        throw BadRequest("invalid continue token");
+        throw BadRequest("continue key is not valid: " + token);
     }
-    auto nl = raw.find('\n');
-    if (nl == std::string::npos) throw BadRequest("invalid continue token");
-    return {raw.substr(0, nl), raw.substr(nl + 1)};
 }
 
 std::uint64_t ParseRv(const std::string& rv) {
@@ -313,19 +411,23 @@ Value Bookmark(const Resource& r, std::uint64_t rv, bool initial_end) {
     return Event("BOOKMARK", o.ExtractValue());
 }
 
-Value ParseBody(const std::string& body) {
-    if (body.empty()) return Value();
+// A body in any of the encodings clients send: protobuf, JSON (repeated
+// keys allowed, as Go allows them), YAML.
+bodies::Parsed ReadBody(const std::string& body, const std::string& content_type) {
+    if (body.empty()) return {};
     if (proto::Decoder::IsProtobuf(body)) {
         const auto* decoder = proto::Decoder::Instance();
         if (!decoder) throw ApiError(415, "UnsupportedMediaType", "this server is not set up for protobuf");
-        return decoder->Decode(body);
+        return {decoder->Decode(body), {}, ""};
     }
     try {
-        return json::FromString(body);
+        return bodies::IsYaml(content_type) ? bodies::Yaml(body) : bodies::Json(body);
     } catch (const std::exception& e) {
-        throw BadRequest(std::string("the request body is not valid JSON: ") + e.what());
+        throw BadRequest(std::string("the request body is not valid: ") + e.what());
     }
 }
+
+Value ParseBody(const std::string& body) { return ReadBody(body, "").value; }
 
 std::int64_t GracePeriod(const http::HttpRequest& req, const Value& options, const Value& object) {
     if (req.HasArg("gracePeriodSeconds")) return std::stoll(Arg(req, "gracePeriodSeconds"));
@@ -484,6 +586,15 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
     }
 
     // Discovery.
+    if (parts.size() == 1 && WantsAggregated(request)) {
+        // The version the client named first; v2beta1 is the same document.
+        const auto accept = request.GetHeader("Accept");
+        const auto version = accept.find("v=v2beta1") != std::string::npos && accept.find("v=v2;") == std::string::npos ? "v2beta1" : "v2";
+        response.SetContentType(std::string("application/json;g=apidiscovery.k8s.io;v=") + version + ";as=APIGroupDiscoveryList");
+        ValueBuilder doc(AggregatedDiscovery(registry_, parts[0] == "api"));
+        doc["apiVersion"] = std::string("apidiscovery.k8s.io/") + version;
+        return json::ToString(doc.ExtractValue());
+    }
     if (parts[0] == "api" && parts.size() == 1) {
         ValueBuilder v(json::Type::kObject);
         v["kind"] = "APIVersions";
@@ -611,8 +722,19 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             auto labels = LabelSelector::Parse(Arg(request, "labelSelector"));
             auto fields = FieldSelector::Parse(Arg(request, "fieldSelector"));
             std::size_t limit = request.HasArg("limit") ? std::stoull(Arg(request, "limit")) : 0;
-            auto [after_ns, after_name] = DecodeContinue(Arg(request, "continue"));
+            const auto cont = DecodeContinue(Arg(request, "continue"));
+            const auto& after_ns = cont.ns;
+            const auto& after_name = cont.name;
+            if (cont.rv > 0 && static_cast<std::uint64_t>(cont.rv) <= store_.Compacted(r)) {
+                ApiError gone(410, "Expired",
+                              "The provided continue parameter is too old to display a consistent list result. You can start a new list without the continue parameter, or use the continue token in this response to retrieve the remainder of the results. Continuing with the provided token results in an inconsistent list - objects that were created, modified, or deleted between the time the first chunk was returned and now may show up in the list.");
+                ValueBuilder status(gone.ToStatus());
+                status["metadata"]["continue"] = EncodeContinue(-1, cont.ns, cont.name);
+                response.SetStatus(http::HttpStatus::kGone);
+                return json::ToString(status.ExtractValue());
+            }
             auto ns = t.ns.empty() && r.namespaced ? fields.Pinned("metadata.namespace") : t.ns;
+            std::int64_t remaining = -1;
             auto render = [&](const std::vector<Value>& items, const std::string& rv, const std::string& cont) {
                 if (table) {
                     std::vector<Value> view;
@@ -624,6 +746,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 list["apiVersion"] = metadata ? "meta.k8s.io/v1" : r.GroupVersion();
                 list["metadata"]["resourceVersion"] = rv;
                 if (!cont.empty()) list["metadata"]["continue"] = cont;
+                if (remaining >= 0) list["metadata"]["remainingItemCount"] = remaining;
                 ValueBuilder out(json::Type::kArray);
                 for (const auto& item : items) out.PushBack(metadata ? tables::Metadata(item) : ToView(r, item));
                 list["items"] = out;
@@ -640,16 +763,19 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             for (auto& item : page.items) {
                 if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) found.push_back(std::move(item));
             }
-            return render(
-                found, std::to_string(page.rv), page.last_name.empty() ? "" : EncodeContinue(page.last_ns, page.last_name)
-            );
+            // Pages after the first report the revision of the first.
+            const auto rv = cont.rv > 0 ? static_cast<std::uint64_t>(cont.rv) : page.rv;
+            remaining = page.last_name.empty() ? -1 : static_cast<std::int64_t>(store_.Count(r, ns, page.last_ns, page.last_name));
+            return render(found, std::to_string(rv), page.last_name.empty() ? "" : EncodeContinue(static_cast<std::int64_t>(rv), page.last_ns, page.last_name));
         }
         if (method == http::HttpMethod::kPost) {
-            auto incoming = CheckFields(r, ParseBody(request.RequestBody()), request.RequestBody(), request);
+            auto parsed = ReadBody(request.RequestBody(), request.GetHeader(userver::http::headers::kContentType));
+            auto incoming = CheckFields(r, parsed.value, parsed, request);
             if (r.namespaced && t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
             auto object = objects::PrepareCreate(r, incoming, t.ns);
             if (IsDefinitions(r)) Crds::Validate(object);
             if (IsWebhookConfig(r)) Webhooks::ValidateConfig(r, object);
+            validation::Validate(r, object);
             auto name = objects::Name(object);
             if (r.namespaced) {
                 auto ns = store_.Get(kNamespaces, "", t.ns);
@@ -768,13 +894,25 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         const auto body = request.RequestBody();
         const auto content_type = request.GetHeader(userver::http::headers::kContentType);
         Services::Change change;
+        // Server-side apply: the configuration lands on what is there, or
+        // creates the object; the patch's own keys are checked like a body's.
+        const bool apply = is_patch && content_type.starts_with("application/apply-patch");
+        if (apply && Arg(request, "fieldManager").empty()) throw BadRequest("PatchOptions.meta.k8s.io \"\" is invalid: fieldManager: Required value: is required for apply patch");
+        const auto parsed = is_patch && !apply ? ReadBody(body, "application/json") : ReadBody(body, apply ? "application/yaml" : content_type);
         auto decide = [&](const std::optional<Value>& stored) -> Decision {
             // A custom resource is patched and checked in the version the
             // client speaks, and stored in the storage version.
             std::optional<Value> current;
             if (stored) current = ToView(r, *stored);
             Value incoming;
-            if (is_patch) {
+            if (apply) {
+                incoming = current ? patch::Strategic(*current, parsed.value) : parsed.value;
+                if (current) {
+                    ValueBuilder b(incoming);
+                    b["metadata"]["resourceVersion"] = (*current)["metadata"]["resourceVersion"];
+                    incoming = b.ExtractValue();
+                }
+            } else if (is_patch) {
                 if (!current) throw NotFound(r.plural, r.group, t.name);
                 incoming = patch::Apply(content_type, *current, body);
                 // A patch writes on top of what it read: no version check unless it set one.
@@ -796,11 +934,11 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                     incoming = b.ExtractValue();
                 }
             } else {
-                incoming = ParseBody(body);
+                incoming = parsed.value;
             }
-            if (spec_part == nullptr && !finalize) incoming = CheckFields(r, incoming, body, request);
+            if (spec_part == nullptr && !finalize) incoming = CheckFields(r, incoming, parsed, request);
             if (!current) {
-                if (is_patch || status_write || finalize) throw NotFound(r.plural, r.group, t.name);
+                if ((is_patch && !apply) || status_write || finalize) throw NotFound(r.plural, r.group, t.name);
                 // An update of a missing object creates it, as upstream does for most kinds.
                 auto object = objects::PrepareCreate(r, incoming, t.ns);
                 if (objects::Name(object) != t.name) throw BadRequest("the name of the object does not match the name on the URL");
@@ -843,6 +981,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 next = objects::PrepareUpdate(r, *current, incoming, status_write);
                 if (IsDefinitions(r) && !status_write) Crds::Validate(next);
                 if (IsWebhookConfig(r)) Webhooks::ValidateConfig(r, next);
+                validation::Validate(r, next);
                 if (IsService(r) && !status_write && !dry_run) next = services_.Assign(next, current, change);
             }
             next = ToStorage(r, next);
@@ -1150,7 +1289,7 @@ Value Api::ToStorage(const Resource& r, const Value& object) const {
     return crds_.Convert(r, object, r.custom->storage_version);
 }
 
-Value Api::CheckFields(const Resource& r, const Value& object, const std::string& body, const http::HttpRequest& request) const {
+Value Api::CheckFields(const Resource& r, const Value& object, const bodies::Parsed& parsed, const http::HttpRequest& request) const {
     auto mode = Arg(request, "fieldValidation");
     if (mode.empty()) mode = "Warn";
     schema::Findings findings;
@@ -1161,8 +1300,12 @@ Value Api::CheckFields(const Resource& r, const Value& object, const std::string
     }
     if (mode == "Ignore") return out;
     std::vector<std::string> issues;
-    for (const auto& d : schema::DuplicateFields(body)) issues.push_back("duplicate field \"" + d + "\"");
     for (const auto& u : findings.unknown) issues.push_back("unknown field \"" + u + "\"");
+    for (const auto& d : parsed.duplicate_fields) issues.push_back("duplicate field \"" + d + "\"");
+    if (!parsed.yaml_duplicate.empty()) {
+        if (mode == "Strict") throw BadRequest(parsed.yaml_duplicate);
+        issues.push_back(parsed.yaml_duplicate);
+    }
     if (issues.empty()) return out;
     if (mode == "Strict") {
         std::string message = "strict decoding error: ";
@@ -1457,11 +1600,12 @@ void Api::HandleStreamRequest(
                 if (matches(objects::Namespace(item), item)) initial_objects.push_back(std::move(item));
             }
         } else {
-            auto oldest = store_.OldestEvent(r);
-            if (oldest > 0 && after + 1 < oldest) {
+            // Events at or before the compacted revision are gone.
+            const auto compacted = store_.Compacted(r);
+            if (after < compacted) {
                 stream.SetStatusCode(200);
                 stream.SetEndOfHeaders();
-                ApiError gone = Gone("too old resource version: " + rv_arg + " (" + std::to_string(oldest - 1) + ")");
+                ApiError gone = Gone("too old resource version: " + rv_arg + " (" + std::to_string(compacted) + ")");
                 stream.PushBodyChunk(json::ToString(Event("ERROR", gone.ToStatus())) + "\n", deadline);
                 return;
             }

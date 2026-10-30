@@ -12,6 +12,9 @@
 
 namespace yapi {
 
+namespace bodies {
+struct Parsed;
+}
 namespace kubelet {
 class Connection;
 }
@@ -64,7 +67,7 @@ private:
     userver::formats::json::Value ToStorage(const Resource& r, const userver::formats::json::Value& object) const;
     // Prunes and checks fields as the request's fieldValidation asks.
     userver::formats::json::Value CheckFields(const Resource& r, const userver::formats::json::Value& object,
-                                              const std::string& body, const userver::server::http::HttpRequest& request) const;
+                                              const bodies::Parsed& parsed, const userver::server::http::HttpRequest& request) const;
     void Warn(const userver::server::http::HttpRequest& request, const std::vector<std::string>& warnings) const;
     void Bind(const std::string& ns, const std::string& name, const std::string& node) const;
     void Evict(const std::string& ns, const std::string& name, const userver::formats::json::Value& options) const;

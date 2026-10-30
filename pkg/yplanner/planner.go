@@ -25,10 +25,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+	resourcehelper "k8s.io/component-helpers/resource"
 	corev1helpers "k8s.io/component-helpers/scheduling/corev1"
 	"k8s.io/component-helpers/scheduling/corev1/nodeaffinity"
 	"k8s.io/klog/v2"
-	resourcehelper "k8s.io/component-helpers/resource"
 )
 
 // Planner places pods whose schedulerName is its own.

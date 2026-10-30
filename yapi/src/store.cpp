@@ -6,6 +6,7 @@
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/engine/future.hpp>
+#include <userver/engine/sleep.hpp>
 #include <userver/engine/task/cancel.hpp>
 #include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value_builder.hpp>
@@ -58,6 +59,10 @@ using userver::storages::Query;
 
 namespace {
 
+// How often the event log is compacted, and so how old a watch or a
+// continue token can get: one to two rounds.
+constexpr auto kCompactEvery = std::chrono::seconds(150);
+
 // `resource` is a keyword in YQL, so the column is `res`.
 const Query kSchema{R"(
 CREATE TABLE IF NOT EXISTS objects (
@@ -71,6 +76,10 @@ CREATE TABLE IF NOT EXISTS revisions (
 CREATE TABLE IF NOT EXISTS events (
     res Utf8, rv Uint64, type Utf8, ns Utf8, value String,
     PRIMARY KEY (res, rv)
+);
+CREATE TABLE IF NOT EXISTS compactions (
+    res Utf8, rv Uint64,
+    PRIMARY KEY (res)
 );
 )"};
 
@@ -138,6 +147,42 @@ SELECT rv, type, ns, value FROM events WHERE res = $resource AND rv > $rv ORDER 
 )",
     Query::Name{"events-after"}};
 
+const Query kCompacted{
+    R"(
+DECLARE $resource AS Utf8;
+SELECT rv FROM compactions WHERE res = $resource;
+)",
+    Query::Name{"compacted"}};
+
+const Query kAllRevisions{
+    R"(
+SELECT res, rv FROM revisions;
+)",
+    Query::Name{"all-revisions"}};
+
+const Query kCompact{
+    R"(
+DECLARE $resource AS Utf8; DECLARE $rv AS Uint64;
+DELETE FROM events WHERE res = $resource AND rv <= $rv;
+UPSERT INTO compactions (res, rv) VALUES ($resource, $rv);
+)",
+    Query::Name{"compact"}};
+
+const Query kCountAll{
+    R"(
+DECLARE $resource AS Utf8; DECLARE $after_ns AS Utf8; DECLARE $after_name AS Utf8;
+SELECT COUNT(*) AS n FROM objects
+WHERE res = $resource AND (ns > $after_ns OR (ns = $after_ns AND name > $after_name));
+)",
+    Query::Name{"count-all"}};
+
+const Query kCountNs{
+    R"(
+DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $after_name AS Utf8;
+SELECT COUNT(*) AS n FROM objects WHERE res = $resource AND ns = $ns AND name > $after_name;
+)",
+    Query::Name{"count-ns"}};
+
 const Query kOldestEvent{
     R"(
 DECLARE $resource AS Utf8;
@@ -163,6 +208,30 @@ Store::Store(const userver::components::ComponentConfig& config, const userver::
     : ComponentBase(config, context),
       table_(context.FindComponent<ydb::YdbComponent>().GetTableClient(config["dbname"].As<std::string>())) {
     EnsureSchema();
+    // Compaction, as etcd does it: what was the newest revision one round
+    // ago goes from the event log now. Watches and continue tokens older
+    // than that get 410 and start over.
+    tasks_.AsyncDetach("compact", [this] {
+        std::map<std::string, std::uint64_t> previous;
+        while (!userver::engine::current_task::ShouldCancel()) {
+            userver::engine::InterruptibleSleepFor(kCompactEvery);
+            if (userver::engine::current_task::ShouldCancel()) return;
+            try {
+                std::map<std::string, std::uint64_t> now;
+                auto res = table_->ExecuteQuery(kAllRevisions);
+                for (auto row : res.GetSingleCursor()) {
+                    now[row.Get<std::optional<ydb::Utf8>>("res").value_or(ydb::Utf8{}).GetUnderlying()] =
+                        row.Get<std::optional<std::uint64_t>>("rv").value_or(0);
+                }
+                for (const auto& [key, rv] : previous) {
+                    if (rv > 0) table_->ExecuteQuery(kCompact, "$resource", ydb::Utf8{key}, "$rv", rv);
+                }
+                previous = std::move(now);
+            } catch (const std::exception& e) {
+                LOG_WARNING() << "compaction: " << e.what();
+            }
+        }
+    });
 }
 
 Store::~Store() { tasks_.CancelAndWait(); }
@@ -286,6 +355,9 @@ Decision Store::Write(const Resource& r, const std::string& ns, const std::strin
         b.queue.push_back(&p);
     }
     b.kick.Send();
+    // The batch holds pointers into this frame (the pending write and the
+    // caller's decide): a client hanging up must not end the wait early.
+    userver::engine::TaskCancellationBlocker block;
     return result.get();
 }
 
@@ -419,6 +491,18 @@ std::vector<WatchEvent> Store::EventsAfter(const Resource& r, std::uint64_t rv, 
         out.push_back(std::move(e));
     }
     return out;
+}
+
+std::uint64_t Store::Compacted(const Resource& r) {
+    auto res = table_->ExecuteQuery(kCompacted, "$resource", ydb::Utf8{r.Key()});
+    return FirstRv(res.GetSingleCursor());
+}
+
+std::uint64_t Store::Count(const Resource& r, const std::string& ns, const std::string& after_ns, const std::string& after_name) {
+    auto res = ns.empty() ? table_->ExecuteQuery(kCountAll, "$resource", ydb::Utf8{r.Key()}, "$after_ns", ydb::Utf8{after_ns}, "$after_name", ydb::Utf8{after_name})
+                          : table_->ExecuteQuery(kCountNs, "$resource", ydb::Utf8{r.Key()}, "$ns", ydb::Utf8{ns}, "$after_name", ydb::Utf8{after_name});
+    for (auto row : res.GetSingleCursor()) return row.Get<std::optional<std::uint64_t>>("n").value_or(0);
+    return 0;
 }
 
 std::uint64_t Store::OldestEvent(const Resource& r) {

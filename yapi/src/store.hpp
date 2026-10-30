@@ -82,6 +82,12 @@ public:
 
     // Events of the resource after the revision, oldest first.
     std::vector<WatchEvent> EventsAfter(const Resource& r, std::uint64_t rv, std::size_t limit);
+    // The revision the event log was compacted to: nothing at or before it
+    // can be watched from or continued at.
+    std::uint64_t Compacted(const Resource& r);
+    // Objects of a list after a key, for remainingItemCount.
+    std::uint64_t Count(const Resource& r, const std::string& ns, const std::string& after_ns, const std::string& after_name);
+
     // The oldest revision still in the event log, 0 when it is empty.
     std::uint64_t OldestEvent(const Resource& r);
 

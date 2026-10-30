@@ -429,6 +429,48 @@ void Quotas(Store& store, const Resource& r, const Value& object) {
     throw ApiError(409, "Conflict", "Operation cannot be fulfilled on resourcequotas: the quotas kept changing; please try again");
 }
 
+
+// RuntimeClass: the class must exist; its overhead and scheduling land on
+// the pod, conflicts refused, as upstream's plugin words them.
+Value RuntimeClass(Store& store, Value pod) {
+    const auto name = pod["spec"]["runtimeClassName"].As<std::string>("");
+    if (name.empty()) {
+        if (pod["spec"].HasMember("overhead")) throw Forbidden("pods", objects::Name(pod), "pod rejected: Pod Overhead set without corresponding RuntimeClass defined Overhead");
+        return pod;
+    }
+    auto rc = store.Get(*Registry::Builtin().Find("node.k8s.io", "v1", "runtimeclasses"), "", name);
+    if (!rc) throw Forbidden("pods", objects::Name(pod), "pod rejected: RuntimeClass \"" + name + "\" not found");
+    ValueBuilder b(pod);
+    const auto fixed = (*rc)["overhead"]["podFixed"];
+    if (fixed.IsObject()) {
+        if (pod["spec"].HasMember("overhead") && pod["spec"]["overhead"] != fixed) {
+            throw Forbidden("pods", objects::Name(pod), "pod rejected: Pod's Overhead doesn't match RuntimeClass's defined Overhead");
+        }
+        b["spec"]["overhead"] = fixed;
+    } else if (pod["spec"].HasMember("overhead")) {
+        throw Forbidden("pods", objects::Name(pod), "pod rejected: Pod Overhead set without corresponding RuntimeClass defined Overhead");
+    }
+    const auto selector = (*rc)["scheduling"]["nodeSelector"];
+    if (selector.IsObject()) {
+        for (auto it = selector.begin(); it != selector.end(); ++it) {
+            const auto mine = pod["spec"]["nodeSelector"][it.GetName()];
+            if (!mine.IsMissing() && mine != *it) {
+                throw Forbidden("pods", objects::Name(pod), "conflict: runtimeClass.scheduling.nodeSelector[" + it.GetName() + "] = " +
+                                                                it->As<std::string>("") + "; pod.spec.nodeSelector[" + it.GetName() + "] = " + mine.As<std::string>(""));
+            }
+            b["spec"]["nodeSelector"][it.GetName()] = *it;
+        }
+    }
+    for (const auto& t : objects::Items((*rc)["scheduling"]["tolerations"])) {
+        bool have = false;
+        for (const auto& mine : objects::Items(pod["spec"]["tolerations"])) have = have || mine == t;
+        if (have) continue;
+        if (!b["spec"].HasMember("tolerations")) b["spec"]["tolerations"] = ValueBuilder(json::Type::kArray);
+        b["spec"]["tolerations"].PushBack(t);
+    }
+    return b.ExtractValue();
+}
+
 }  // namespace
 
 Value Admit(Store& store, const Resource& r, Value object) {
@@ -437,6 +479,7 @@ Value Admit(Store& store, const Resource& r, Value object) {
         if (object["metadata"]["annotations"].HasMember("kubernetes.io/config.mirror")) return object;
         object = Priority(store, object);
         object = DefaultTolerations(object);
+        object = RuntimeClass(store, object);
         object = LimitRanges(store, r, object);
         object = ServiceAccount(store, object);
         Quotas(store, r, object);

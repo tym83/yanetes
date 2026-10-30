@@ -458,10 +458,21 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 		failReason, failMsg = "DeadlineExceeded", "Job was active longer than specified deadline"
 	}
 	succeededEnough := false
+	successReason, successMsg := "CompletionsReached", "Reached expected number of succeeded pods"
+	if successTarget != nil {
+		successReason, successMsg = successTarget.Reason, successTarget.Message
+	}
 	if failReason == "" {
+		rule := -1
+		if indexed && job.Spec.SuccessPolicy != nil && successTarget == nil {
+			rule = successPolicyMatch(job.Spec.SuccessPolicy, completed)
+		}
 		switch {
 		case successTarget != nil:
 			succeededEnough = true
+		case rule >= 0:
+			succeededEnough = true
+			successReason, successMsg = batchv1.JobReasonSuccessPolicy, fmt.Sprintf("Matched rules at index %d", rule)
 		case indexed:
 			succeededEnough = completions != nil && len(completed) >= int(*completions)
 		case completions != nil:
@@ -477,14 +488,14 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 		if failReason != "" {
 			status.Conditions = setJobCondition(status.Conditions, batchv1.JobFailureTarget, corev1.ConditionTrue, failReason, failMsg, now)
 		} else {
-			status.Conditions = setJobCondition(status.Conditions, batchv1.JobSuccessCriteriaMet, corev1.ConditionTrue, "CompletionsReached", "Reached expected number of succeeded pods", now)
+			status.Conditions = setJobCondition(status.Conditions, batchv1.JobSuccessCriteriaMet, corev1.ConditionTrue, successReason, successMsg, now)
 		}
 		errs = j.deletePods(ctx, key, activePods)
 		if errs == nil && len(activePods) == 0 && terminating == 0 {
 			if failReason != "" {
 				status.Conditions = setJobCondition(status.Conditions, batchv1.JobFailed, corev1.ConditionTrue, failReason, failMsg, now)
 			} else {
-				status.Conditions = setJobCondition(status.Conditions, batchv1.JobComplete, corev1.ConditionTrue, "CompletionsReached", "Reached expected number of succeeded pods", now)
+				status.Conditions = setJobCondition(status.Conditions, batchv1.JobComplete, corev1.ConditionTrue, successReason, successMsg, now)
 				status.CompletionTime = &now
 			}
 		}
@@ -521,6 +532,46 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 		}
 	}
 	return nil
+}
+
+// successPolicyMatch returns the first rule of an indexed job's success
+// policy the completed indexes satisfy, or -1.
+func successPolicyMatch(policy *batchv1.SuccessPolicy, completed map[int]bool) int {
+	for i, r := range policy.Rules {
+		count := 0
+		satisfied := true
+		if r.SucceededIndexes != nil {
+			for _, part := range strings.Split(*r.SucceededIndexes, ",") {
+				lo, hi, found := strings.Cut(strings.TrimSpace(part), "-")
+				first, err1 := strconv.Atoi(lo)
+				last := first
+				var err2 error
+				if found {
+					last, err2 = strconv.Atoi(hi)
+				}
+				if err1 != nil || err2 != nil {
+					satisfied = false
+					break
+				}
+				for k := first; k <= last; k++ {
+					if completed[k] {
+						count++
+					} else if r.SucceededCount == nil {
+						satisfied = false
+					}
+				}
+			}
+		} else {
+			count = len(completed)
+		}
+		if r.SucceededCount != nil && count < int(*r.SucceededCount) {
+			satisfied = false
+		}
+		if satisfied {
+			return i
+		}
+	}
+	return -1
 }
 
 // manage starts or stops pods to keep the number running the job asks for.

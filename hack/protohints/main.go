@@ -4,15 +4,17 @@
 //   - pointer-fields.txt: scalar fields behind a pointer (*string, *int32,
 //     *bool, ...), where "", 0 and false are values: protobuf writes every
 //     other scalar even when it is zero, where JSON leaves it out;
+//
 //   - inline-fields.txt: embedded structs JSON inlines (Volume's
 //     VolumeSource), which protobuf keeps as a field of their own;
+//
 //   - renamed-fields.txt: "message.field jsonName" where the protobuf name
 //     is not the JSON one (admissionregistration's "Webhooks").
 //
-//	go run ./hack/protohints <proto-dir> \
-//	  $(go list -m -f '{{.Dir}}' k8s.io/api)=k8s.io.api \
-//	  $(go list -m -f '{{.Dir}}' k8s.io/apimachinery)=k8s.io.apimachinery \
-//	  $(go list -m -f '{{.Dir}}' k8s.io/apiextensions-apiserver)=k8s.io.apiextensions_apiserver
+//     go run ./hack/protohints <proto-dir> \
+//     $(go list -m -f '{{.Dir}}' k8s.io/api)=k8s.io.api \
+//     $(go list -m -f '{{.Dir}}' k8s.io/apimachinery)=k8s.io.apimachinery \
+//     $(go list -m -f '{{.Dir}}' k8s.io/apiextensions-apiserver)=k8s.io.apiextensions_apiserver
 package main
 
 import (
