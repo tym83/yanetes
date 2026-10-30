@@ -82,6 +82,8 @@ public:
 
     // Events of the resource after the revision, oldest first.
     std::vector<WatchEvent> EventsAfter(const Resource& r, std::uint64_t rv, std::size_t limit);
+    // The last change of an object before a revision, while the log has it.
+    std::optional<WatchEvent> EventBefore(const Resource& r, const std::string& ns, const std::string& name, std::uint64_t rv);
     // The revision the event log was compacted to: nothing at or before it
     // can be watched from or continued at.
     std::uint64_t Compacted(const Resource& r);

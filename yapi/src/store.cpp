@@ -147,6 +147,13 @@ SELECT rv, type, ns, value FROM events WHERE res = $resource AND rv > $rv ORDER 
 )",
     Query::Name{"events-after"}};
 
+const Query kEventsBefore{
+    R"(
+DECLARE $resource AS Utf8; DECLARE $rv AS Uint64; DECLARE $ns AS Utf8; DECLARE $limit AS Uint64;
+SELECT rv, type, ns, value FROM events WHERE res = $resource AND rv < $rv AND ns = $ns ORDER BY rv DESC LIMIT $limit;
+)",
+    Query::Name{"events-before"}};
+
 const Query kCompacted{
     R"(
 DECLARE $resource AS Utf8;
@@ -491,6 +498,25 @@ std::vector<WatchEvent> Store::EventsAfter(const Resource& r, std::uint64_t rv, 
         out.push_back(std::move(e));
     }
     return out;
+}
+
+std::optional<WatchEvent> Store::EventBefore(const Resource& r, const std::string& ns, const std::string& name, std::uint64_t rv) {
+    // Newest first within the namespace; the log holds a few minutes, so
+    // the scan stays short.
+    auto res = table_->ExecuteQuery(
+        kEventsBefore, "$resource", ydb::Utf8{r.Key()}, "$rv", rv, "$ns", ydb::Utf8{ns}, "$limit", static_cast<std::uint64_t>(5000)
+    );
+    for (auto row : res.GetSingleCursor()) {
+        auto object = json::FromString(row.Get<std::optional<std::string>>("value").value_or("{}"));
+        if (object["metadata"]["name"].As<std::string>("") != name) continue;
+        WatchEvent e;
+        e.rv = row.Get<std::optional<std::uint64_t>>("rv").value_or(0);
+        e.type = row.Get<std::optional<ydb::Utf8>>("type").value_or(ydb::Utf8{}).GetUnderlying();
+        e.ns = ns;
+        e.object = std::move(object);
+        return e;
+    }
+    return std::nullopt;
 }
 
 std::uint64_t Store::Compacted(const Resource& r) {

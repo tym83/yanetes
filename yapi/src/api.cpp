@@ -1815,9 +1815,12 @@ void Api::HandleStreamRequest(
 
         // With a selector, an object that stops matching leaves the watch
         // as DELETED and one that starts matching joins as ADDED, so the
-        // watch keeps the keys of what it has shown.
+        // watch keeps the keys of what it has shown, as of a list taken at
+        // seeded_rv. Changes older than that list are judged by the version
+        // before them in the event log.
         const bool selective = !labels.Empty() || !fields.Empty();
-        std::set<std::pair<std::string, std::string>> shown;
+        std::set<std::pair<std::string, std::string>> shown, judged;
+        std::uint64_t seeded_rv = 0;
         auto key_of = [](const Value& o) { return std::make_pair(objects::Namespace(o), objects::Name(o)); };
 
         std::uint64_t after = ParseRv(rv_arg);
@@ -1833,7 +1836,9 @@ void Api::HandleStreamRequest(
             }
         } else {
             if (selective) {
-                for (const auto& item : store_.List(r, ns, 0, "", "").items) {
+                auto page = store_.List(r, ns, 0, "", "");
+                seeded_rv = page.rv;
+                for (const auto& item : page.items) {
                     if (matches(objects::Namespace(item), item)) shown.insert(key_of(item));
                 }
             }
@@ -1881,13 +1886,21 @@ void Api::HandleStreamRequest(
             }
             stream.PushBodyChunk(json::ToString(event) + "\n", deadline);
         };
-        auto deliver = [&](const std::string& type, const std::string& event_ns, const Value& object) {
+        auto deliver = [&](const std::string& type, const std::string& event_ns, const Value& object, std::uint64_t rv) {
             const bool now = matches(event_ns, object);
             if (!selective) {
                 if (now) send(Event(type, object));
                 return;
             }
             const auto key = key_of(object);
+            if (rv <= seeded_rv && judged.insert(key).second) {
+                const auto before = type == "ADDED" ? std::nullopt : store_.EventBefore(r, key.first, key.second, rv);
+                if (before && before->type != "DELETED" && matches(before->ns, before->object)) {
+                    shown.insert(key);
+                } else if (before || type == "ADDED") {
+                    shown.erase(key);
+                }
+            }
             const bool was = shown.count(key) > 0;
             if (type == "DELETED") {
                 if (was || now) send(Event("DELETED", object));
@@ -1908,7 +1921,7 @@ void Api::HandleStreamRequest(
             if (events.empty()) break;
             for (const auto& e : events) {
                 if (e.rv > sub->ReplayUntil()) break;
-                deliver(e.type, e.ns, e.object);
+                deliver(e.type, e.ns, e.object, e.rv);
                 last = e.rv;
             }
             if (events.back().rv >= sub->ReplayUntil()) break;
@@ -1927,7 +1940,7 @@ void Api::HandleStreamRequest(
             }
             if (e) {
                 last = e->rv;
-                deliver(e->type, e->ns, e->object);
+                deliver(e->type, e->ns, e->object, e->rv);
             }
             if (bookmarks && std::chrono::steady_clock::now() - last_bookmark > std::chrono::seconds(30)) {
                 send(Bookmark(r, std::max(last, watch_.Delivered(r)), false));
