@@ -65,7 +65,30 @@ ApiError Conflict(const std::string& plural, const std::string& group, const std
 ApiError BadRequest(const std::string& message) { return ApiError(400, "BadRequest", message); }
 
 ApiError Invalid(const std::string& kind, const std::string& group, const std::string& name, const std::string& message) {
-    return ApiError(422, "Invalid", kind + " \"" + name + "\" is invalid: " + message).About(kind, group, name);
+    ApiError e(422, "Invalid", kind + " \"" + name + "\" is invalid: " + message);
+    e.About(kind, group, name);
+    // Each "field: reason" of the message is a cause; kubectl prints them.
+    std::string list = message;
+    if (list.size() > 1 && list.front() == '[' && list.back() == ']') list = list.substr(1, list.size() - 2);
+    std::size_t start = 0;
+    while (start < list.size()) {
+        auto end = list.find(", ", start);
+        // Only split where the next item starts a new "field: " pair.
+        while (end != std::string::npos && list.find(": ", end + 2) != std::string::npos &&
+               list.substr(end + 2, list.find(": ", end + 2) - end - 2).find(' ') != std::string::npos) {
+            end = list.find(", ", end + 2);
+        }
+        auto item = list.substr(start, end == std::string::npos ? std::string::npos : end - start);
+        auto colon = item.find(": ");
+        auto field = colon == std::string::npos ? std::string() : item.substr(0, colon);
+        auto reason = item.find(": Required value") != std::string::npos ? "FieldValueRequired"
+                      : item.find(": Unsupported value") != std::string::npos ? "FieldValueNotSupported"
+                                                                              : "FieldValueInvalid";
+        e.Cause(reason, colon == std::string::npos ? item : item.substr(colon + 2), field);
+        if (end == std::string::npos) break;
+        start = end + 2;
+    }
+    return e;
 }
 
 ApiError Gone(const std::string& message) { return ApiError(410, "Expired", message); }

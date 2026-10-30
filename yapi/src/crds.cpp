@@ -258,7 +258,7 @@ void Crds::Reconcile(const Value& crd) {
         };
         next_status["storedVersions"] = stored;
         auto desired = next_status.ExtractValue();
-        if (desired == status) return Decision::Keep();
+        if (status.IsObject() && desired == status) return Decision::Keep();
         ValueBuilder b(*current);
         b["status"] = desired;
         return Decision::Put(b.ExtractValue());

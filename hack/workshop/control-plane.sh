@@ -64,12 +64,12 @@ proto-dir: /opt/yandexnetes/proto
 ydb-endpoint: ydb.$NS.svc.cozy.local:2136
 ydb-database: /local
 worker-threads: 4
-log-level: info
+log-level: warning
 service-account-key-file: /etc/yandexnetes/cp/pki/sa.key
 advertise-address: $IP
 service-cidr: 10.112.0.0/16
 EOF
-sudo sed 's|server: .*|server: https://127.0.0.1:6443|' /etc/yandexnetes/cp/admin.conf | sudo tee /etc/yandexnetes/cp/local.conf >/dev/null
+sudo sed -E 's#server: \"?https://[^\",} ]*\"?#server: \"https://127.0.0.1:6443\"#' /etc/yandexnetes/cp/admin.conf | sudo tee /etc/yandexnetes/cp/local.conf >/dev/null
 unit() { sudo tee /etc/systemd/system/\$1.service >/dev/null; }
 unit yapi <<EOF
 [Unit]
@@ -113,7 +113,7 @@ sudo systemctl daemon-reload"
     n=${vmi#vm-instance-}
     vm "$n" "sudo sed -i 's|server: \"https://[^\"]*\"|server: \"$API\"|' /etc/yandexnetes/kubelet.conf /etc/yandexnetes/kube-proxy.conf && sudo systemctl restart kubelet kube-proxy flanneld"
   done
-  b cxx "sed -i 's|server: https://[^ ]*|server: $API|' /work/run/admin.conf"
+  b cxx "sed -i -E 's#server: \"?https://[^\",} ]*\"?#server: \"$API\"#' /work/run/admin.conf"
 else
   vm "$NODE" "sudo systemctl restart yapi && sleep 3 && sudo systemctl restart nanny yplanner"
 fi
