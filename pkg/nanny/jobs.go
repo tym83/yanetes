@@ -340,6 +340,16 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 	}
 	uncounted := status.UncountedTerminatedPods
 	completed := parseIndexes(status.CompletedIndexes)
+	// Per-index backoff: an index whose pods failed too often, or that a
+	// FailIndex rule matched, is given up; the rest go on.
+	perIndex := indexed && job.Spec.BackoffLimitPerIndex != nil
+	failedIdx := parseIndexes(ptr.Deref(status.FailedIndexes, ""))
+	indexFailures := map[int]int{}
+	for _, p := range pods {
+		if i := podIndex(p); i >= 0 && p.Status.Phase == corev1.PodFailed {
+			indexFailures[i] = max(indexFailures[i], indexFailureCount(p)+1)
+		}
+	}
 
 	var activePods []*corev1.Pod
 	var terminating, ready int32
@@ -375,6 +385,11 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 				continue
 			case batchv1.PodFailurePolicyActionFailJob:
 				failJob, failMessage = true, msg
+			}
+			if perIndex {
+				if i := podIndex(p); i >= 0 && (action == batchv1.PodFailurePolicyActionFailIndex || indexFailureCount(p)+1 > int(*job.Spec.BackoffLimitPerIndex)) {
+					failedIdx[i] = true
+				}
 			}
 			uncounted.Failed = append(uncounted.Failed, p.UID)
 		} else {
@@ -433,6 +448,9 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 	if indexed {
 		status.CompletedIndexes = formatIndexes(completed)
 	}
+	if perIndex {
+		status.FailedIndexes = ptr.To(formatIndexes(failedIdx))
+	}
 
 	suspended := ptr.Deref(job.Spec.Suspend, false)
 	if status.StartTime == nil && !suspended {
@@ -451,7 +469,11 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 	case successTarget != nil:
 	case failJob:
 		failReason, failMsg = "PodFailurePolicy", failMessage
-	case status.Failed > ptr.Deref(job.Spec.BackoffLimit, 6):
+	case perIndex && job.Spec.MaxFailedIndexes != nil && len(failedIdx) > int(*job.Spec.MaxFailedIndexes):
+		failReason, failMsg = batchv1.JobReasonMaxFailedIndexesExceeded, "Job has exceeded the specified maximal number of failed indexes"
+	case perIndex && len(failedIdx) > 0 && len(failedIdx)+len(completed) >= int(ptr.Deref(completions, 0)):
+		failReason, failMsg = batchv1.JobReasonFailedIndexes, "Job has failed indexes"
+	case !perIndex && status.Failed > ptr.Deref(job.Spec.BackoffLimit, 6):
 		failReason, failMsg = "BackoffLimitExceeded", "Job has reached the specified backoff limit"
 	case job.Spec.ActiveDeadlineSeconds != nil && status.StartTime != nil && !suspended &&
 		now.Sub(status.StartTime.Time) >= time.Duration(*job.Spec.ActiveDeadlineSeconds)*time.Second:
@@ -512,7 +534,7 @@ func (j *Jobs) reconcile(ctx context.Context, key string, job *batchv1.Job, pods
 			status.StartTime = &now
 		}
 		if j.exp.satisfied(key) {
-			activePods, errs = j.manage(ctx, key, job, &status, activePods, terminating, completed, indexed, parallelism)
+			activePods, errs = j.manage(ctx, key, job, &status, activePods, terminating, completed, failedIdx, indexFailures, indexed, parallelism)
 		}
 	}
 
@@ -576,12 +598,12 @@ func successPolicyMatch(policy *batchv1.SuccessPolicy, completed map[int]bool) i
 
 // manage starts or stops pods to keep the number running the job asks for.
 func (j *Jobs) manage(ctx context.Context, key string, job *batchv1.Job, status *batchv1.JobStatus, activePods []*corev1.Pod,
-	terminating int32, completed map[int]bool, indexed bool, parallelism int32) ([]*corev1.Pod, error) {
+	terminating int32, completed, failedIdx map[int]bool, indexFailures map[int]int, indexed bool, parallelism int32) ([]*corev1.Pod, error) {
 	want := parallelism
 	if indexed {
 		left := int32(0)
 		for i := 0; i < int(ptr.Deref(job.Spec.Completions, 0)); i++ {
-			if !completed[i] {
+			if !completed[i] && !failedIdx[i] {
 				left++
 			}
 		}
@@ -621,7 +643,7 @@ func (j *Jobs) manage(ctx context.Context, key string, job *batchv1.Job, status 
 			taken[podIndex(p)] = true
 		}
 		for i := 0; i < int(ptr.Deref(job.Spec.Completions, 0)) && len(indexes) < diff; i++ {
-			if !completed[i] && !taken[i] {
+			if !completed[i] && !taken[i] && !failedIdx[i] {
 				indexes = append(indexes, i)
 			}
 		}
@@ -637,6 +659,9 @@ func (j *Jobs) manage(ctx context.Context, key string, job *batchv1.Job, status 
 		if indexed {
 			addIndex(job, template, indexes[n])
 			generate = fmt.Sprintf("%s-%d-", job.Name, indexes[n])
+			if job.Spec.BackoffLimitPerIndex != nil {
+				template.Annotations[jobIndexFailureCountAnnotation] = strconv.Itoa(indexFailures[indexes[n]])
+			}
 		}
 		go func() { errs <- createPod(ctx, j.client, job, kindJob, template, generate) }()
 	}
@@ -651,6 +676,14 @@ func (j *Jobs) manage(ctx context.Context, key string, job *batchv1.Job, status 
 		first = nil
 	}
 	return activePods, first
+}
+
+const jobIndexFailureCountAnnotation = "batch.kubernetes.io/job-index-failure-count"
+
+// indexFailureCount is how many pods of the pod's index failed before it.
+func indexFailureCount(p *corev1.Pod) int {
+	n, _ := strconv.Atoi(p.Annotations[jobIndexFailureCountAnnotation])
+	return n
 }
 
 // addIndex marks a pod of an Indexed job with its index, as upstream does:
