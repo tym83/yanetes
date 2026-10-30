@@ -3,6 +3,7 @@ module github.com/tym83/yandexnetes
 go 1.26.0
 
 require (
+	github.com/robfig/cron/v3 v3.0.1
 	k8s.io/api v0.37.2
 	k8s.io/apimachinery v0.37.2
 	k8s.io/client-go v0.37.2
