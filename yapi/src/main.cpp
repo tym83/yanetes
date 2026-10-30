@@ -11,6 +11,7 @@
 
 #include <api.hpp>
 #include <auth.hpp>
+#include <crds.hpp>
 #include <objects.hpp>
 #include <proto.hpp>
 #include <registry.hpp>
@@ -94,6 +95,7 @@ int main(int argc, char* argv[]) {
                     .Append<yapi::Bootstrap>()
                     .Append<yapi::Auth>()
                     .Append<yapi::Services>()
+                    .Append<yapi::Crds>()
                     .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.
     for (const char* name : {"api-0", "api-1", "api-2", "api-3", "api-4", "api-5", "api-6", "api-7", "api-8",

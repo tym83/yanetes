@@ -28,7 +28,8 @@ Resource R(
         has_status,
         std::move(short_names),
         std::move(categories),
-        std::move(verbs)};
+        std::move(verbs),
+        nullptr};
 }
 
 std::vector<Resource> BuiltinResources() {
@@ -87,6 +88,21 @@ std::vector<Resource> BuiltinResources() {
         R("apiextensions.k8s.io", "v1", "customresourcedefinitions", "customresourcedefinition", "CustomResourceDefinition", kCluster, kStatus, {"crd", "crds"}),
         R("admissionregistration.k8s.io", "v1", "mutatingwebhookconfigurations", "mutatingwebhookconfiguration", "MutatingWebhookConfiguration", kCluster, kPlain),
         R("admissionregistration.k8s.io", "v1", "validatingwebhookconfigurations", "validatingwebhookconfiguration", "ValidatingWebhookConfiguration", kCluster, kPlain),
+        R("admissionregistration.k8s.io", "v1", "validatingadmissionpolicies", "validatingadmissionpolicy", "ValidatingAdmissionPolicy", kCluster, kStatus),
+        R("admissionregistration.k8s.io", "v1", "validatingadmissionpolicybindings", "validatingadmissionpolicybinding", "ValidatingAdmissionPolicyBinding", kCluster, kPlain),
+        R("admissionregistration.k8s.io", "v1", "mutatingadmissionpolicies", "mutatingadmissionpolicy", "MutatingAdmissionPolicy", kCluster, kPlain),
+        R("admissionregistration.k8s.io", "v1", "mutatingadmissionpolicybindings", "mutatingadmissionpolicybinding", "MutatingAdmissionPolicyBinding", kCluster, kPlain),
+        R("apiregistration.k8s.io", "v1", "apiservices", "apiservice", "APIService", kCluster, kStatus),
+        R("certificates.k8s.io", "v1", "clustertrustbundles", "clustertrustbundle", "ClusterTrustBundle", kCluster, kPlain),
+        R("certificates.k8s.io", "v1", "podcertificaterequests", "podcertificaterequest", "PodCertificateRequest", kNs, kStatus),
+        R("resource.k8s.io", "v1", "deviceclasses", "deviceclass", "DeviceClass", kCluster, kPlain),
+        R("resource.k8s.io", "v1", "devicetaintrules", "devicetaintrule", "DeviceTaintRule", kCluster, kStatus),
+        R("resource.k8s.io", "v1", "resourceclaims", "resourceclaim", "ResourceClaim", kNs, kStatus),
+        R("resource.k8s.io", "v1", "resourceclaimtemplates", "resourceclaimtemplate", "ResourceClaimTemplate", kNs, kPlain),
+        R("resource.k8s.io", "v1", "resourceslices", "resourceslice", "ResourceSlice", kCluster, kPlain),
+        R("storage.k8s.io", "v1", "csistoragecapacities", "csistoragecapacity", "CSIStorageCapacity", kNs, kPlain),
+        R("storage.k8s.io", "v1", "volumeattributesclasses", "volumeattributesclass", "VolumeAttributesClass", kCluster, kPlain, {"vac"}),
+        R("storagemigration.k8s.io", "v1", "storageversionmigrations", "storageversionmigration", "StorageVersionMigration", kCluster, kStatus),
         R("flowcontrol.apiserver.k8s.io", "v1", "flowschemas", "flowschema", "FlowSchema", kCluster, kStatus),
         R("flowcontrol.apiserver.k8s.io", "v1", "prioritylevelconfigurations", "prioritylevelconfiguration", "PriorityLevelConfiguration", kCluster, kStatus),
     };
@@ -95,17 +111,19 @@ std::vector<Resource> BuiltinResources() {
 }  // namespace
 
 const Registry& Registry::Builtin() {
-    static const Registry registry = [] {
-        Registry r;
-        r.resources_ = BuiltinResources();
-        return r;
-    }();
+    static const Registry registry(BuiltinResources());
     return registry;
 }
 
 const Resource* Registry::Find(const std::string& group, const std::string& version, const std::string& plural) const {
     for (const auto& r : resources_) {
         if (r.group == group && r.version == version && r.plural == plural) return &r;
+    }
+    auto custom = custom_.Read();
+    for (const auto& [crd, list] : *custom) {
+        for (const auto* r : list) {
+            if (r->group == group && r->version == version && r->plural == plural) return r;
+        }
     }
     return nullptr;
 }
@@ -114,17 +132,59 @@ const Resource* Registry::FindByKind(const std::string& group, const std::string
     for (const auto& r : resources_) {
         if (r.group == group && r.kind == kind) return &r;
     }
+    auto custom = custom_.Read();
+    for (const auto& [crd, list] : *custom) {
+        for (const auto* r : list) {
+            if (r->group == group && r->kind == kind && r->version == r->custom->storage_version) return r;
+        }
+    }
     return nullptr;
+}
+
+std::vector<const Resource*> Registry::All() const {
+    std::vector<const Resource*> out;
+    for (const auto& r : resources_) out.push_back(&r);
+    auto custom = custom_.Read();
+    for (const auto& [crd, list] : *custom) out.insert(out.end(), list.begin(), list.end());
+    return out;
 }
 
 std::vector<std::string> Registry::GroupVersions() const {
     std::vector<std::string> out;
-    for (const auto& r : resources_) {
-        if (r.group.empty()) continue;
-        auto gv = r.GroupVersion();
+    for (const auto* r : All()) {
+        if (r->group.empty()) continue;
+        auto gv = r->GroupVersion();
         if (std::find(out.begin(), out.end(), gv) == out.end()) out.push_back(gv);
     }
     return out;
+}
+
+std::string Registry::PreferredVersion(const std::string& group) const {
+    std::string first;
+    for (const auto* r : All()) {
+        if (r->group != group) continue;
+        if (r->custom && r->version == r->custom->storage_version) return r->version;
+        if (first.empty()) first = r->version;
+    }
+    return first;
+}
+
+void Registry::SetCustom(const std::string& crd, std::vector<Resource> resources) const {
+    std::vector<const Resource*> stable;
+    {
+        std::unique_lock lock(storage_mutex_);
+        for (auto& r : resources) {
+            storage_.push_back(std::move(r));
+            stable.push_back(&storage_.back());
+        }
+    }
+    auto custom = custom_.StartWrite();
+    if (stable.empty()) {
+        custom->erase(crd);
+    } else {
+        (*custom)[crd] = std::move(stable);
+    }
+    custom.Commit();
 }
 
 }  // namespace yapi

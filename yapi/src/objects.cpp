@@ -429,14 +429,14 @@ Value PrepareCreate(const Resource& r, Value object, const std::string& ns) {
     } else if (meta.HasMember("namespace")) {
         meta.Remove("namespace");
     }
-    meta["uid"] = NewUid();
+    const auto uid = NewUid();
+    meta["uid"] = uid;
     meta["creationTimestamp"] = Now();
     if (meta.HasMember("resourceVersion")) meta.Remove("resourceVersion");
     if (meta.HasMember("deletionTimestamp")) meta.Remove("deletionTimestamp");
     if (r.has_status) meta["generation"] = 1;
     if (r.group == "batch" && r.plural == "jobs" && !object["spec"]["manualSelector"].As<bool>(false)) {
         // A job's pods are found by its uid, which nobody but the server knows.
-        const auto uid = meta["uid"].ExtractValue();
         json::ValueBuilder labels(Object(object["spec"]["template"]["metadata"]["labels"]));
         labels["batch.kubernetes.io/controller-uid"] = uid;
         labels["batch.kubernetes.io/job-name"] = name;

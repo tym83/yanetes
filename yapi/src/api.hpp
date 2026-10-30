@@ -15,6 +15,7 @@ namespace kubelet {
 class Connection;
 }
 class Auth;
+class Crds;
 class Services;
 class Store;
 class Watch;
@@ -52,6 +53,12 @@ private:
     std::pair<std::unique_ptr<kubelet::Connection>, std::string> KubeletTarget(
         const userver::server::http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub
     ) const;
+    // Custom resources: the object as the client's version shows it, and as stored.
+    userver::formats::json::Value ToView(const Resource& r, const userver::formats::json::Value& object) const;
+    userver::formats::json::Value ToStorage(const Resource& r, const userver::formats::json::Value& object) const;
+    // Prunes and checks fields as the request's fieldValidation asks.
+    userver::formats::json::Value CheckFields(const Resource& r, const userver::formats::json::Value& object,
+                                              const std::string& body, const userver::server::http::HttpRequest& request) const;
     void Bind(const std::string& ns, const std::string& name, const std::string& node) const;
     void Evict(const std::string& ns, const std::string& name, const userver::formats::json::Value& options) const;
     std::string TokenRequest(const std::string& ns, const std::string& name, const userver::server::http::HttpRequest& request) const;
@@ -60,6 +67,7 @@ private:
     Watch& watch_;
     Auth& auth_;
     Services& services_;
+    Crds& crds_;
     const Registry& registry_;
     std::string openapi_dir_;
 };

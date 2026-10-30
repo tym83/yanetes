@@ -182,6 +182,16 @@ Value Admit(Store& store, const Resource& r, Value object) {
         return ServiceAccount(store, object);
     }
     if (r.group.empty() && r.plural == "nodes") return NodeTaints(object);
+    if (r.group == "apiextensions.k8s.io" && r.plural == "customresourcedefinitions") {
+        // A definition's objects go before it does.
+        for (const auto& f : objects::Items(object["metadata"]["finalizers"])) {
+            if (f.As<std::string>("") == "customresourcecleanup.apiextensions.k8s.io") return object;
+        }
+        ValueBuilder b(object);
+        if (!b["metadata"].HasMember("finalizers")) b["metadata"]["finalizers"] = ValueBuilder(json::Type::kArray);
+        b["metadata"]["finalizers"].PushBack("customresourcecleanup.apiextensions.k8s.io");
+        return b.ExtractValue();
+    }
     return object;
 }
 

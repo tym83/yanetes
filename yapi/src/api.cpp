@@ -1,6 +1,7 @@
 #include <api.hpp>
 
 #include <fstream>
+#include <functional>
 #include <tuple>
 #include <sstream>
 
@@ -24,10 +25,12 @@
 
 #include <admission.hpp>
 #include <auth.hpp>
+#include <crds.hpp>
 #include <kubelet.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
 #include <proto.hpp>
+#include <schema.hpp>
 #include <selectors.hpp>
 #include <services.hpp>
 #include <status.hpp>
@@ -72,22 +75,59 @@ std::vector<std::string> Verbs(const Resource& r) {
 bool IsServiceAccount(const Resource& r) { return r.group.empty() && r.plural == "serviceaccounts"; }
 bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
 bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
+bool IsDefinitions(const Resource& r) { return r.group == "apiextensions.k8s.io" && r.plural == "customresourcedefinitions"; }
 bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
 // Pod subresources served by the pod's kubelet.
 bool KubeletSub(const std::string& sub) { return sub == "log" || sub == "exec" || sub == "attach" || sub == "portforward"; }
 
 bool HasScale(const Resource& r) {
+    if (r.custom) return r.custom->scale;
     return (r.group == "apps" && (r.plural == "deployments" || r.plural == "replicasets" || r.plural == "statefulsets")) ||
            (r.group.empty() && r.plural == "replicationcontrollers");
 }
 
+// A field at a ".spec.replicas" path, as scale subresources name them.
+Value AtPath(const Value& object, const std::string& path) {
+    Value v = object;
+    std::stringstream ss(path);
+    std::string part;
+    while (std::getline(ss, part, '.')) {
+        if (part.empty()) continue;
+        if (!v.IsObject() || !v.HasMember(part)) return Value();
+        v = v[part];
+    }
+    return v;
+}
+
+Value SetAtPath(const Value& object, const std::string& path, const Value& value) {
+    std::vector<std::string> parts;
+    std::stringstream ss(path);
+    for (std::string part; std::getline(ss, part, '.');) {
+        if (!part.empty()) parts.push_back(part);
+    }
+    std::function<Value(const Value&, std::size_t)> set = [&](const Value& v, std::size_t i) -> Value {
+        if (i == parts.size()) return value;
+        ValueBuilder b(v.IsObject() ? v : ValueBuilder(json::Type::kObject).ExtractValue());
+        b[parts[i]] = set(v.IsObject() && v.HasMember(parts[i]) ? v[parts[i]] : Value(), i + 1);
+        return b.ExtractValue();
+    };
+    return set(object, 0);
+}
+
 // The autoscaling/v1 Scale of an object with replicas.
-Value ScaleOf(const Value& object) {
+Value ScaleOf(const Resource& r, const Value& object) {
     ValueBuilder b(json::Type::kObject);
     b["kind"] = "Scale";
     b["apiVersion"] = "autoscaling/v1";
     for (const char* key : {"name", "namespace", "uid", "resourceVersion", "creationTimestamp"}) {
         if (object["metadata"].HasMember(key)) b["metadata"][key] = object["metadata"][key];
+    }
+    if (r.custom) {
+        b["spec"]["replicas"] = AtPath(object, r.custom->spec_replicas).As<std::int64_t>(0);
+        b["status"]["replicas"] = AtPath(object, r.custom->status_replicas).As<std::int64_t>(0);
+        auto selector = AtPath(object, r.custom->label_selector);
+        if (selector.IsString()) b["status"]["selector"] = selector;
+        return b.ExtractValue();
     }
     b["spec"]["replicas"] = object["spec"]["replicas"].As<std::int64_t>(0);
     b["status"]["replicas"] = object["status"]["replicas"].As<std::int64_t>(0);
@@ -102,7 +142,8 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
     b["apiVersion"] = "v1";
     b["groupVersion"] = gv;
     ValueBuilder list(json::Type::kArray);
-    for (const auto& r : reg.All()) {
+    for (const auto* rp : reg.All()) {
+        const auto& r = *rp;
         if (r.GroupVersion() != gv) continue;
         ValueBuilder e(json::Type::kObject);
         e["name"] = r.plural;
@@ -116,6 +157,7 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
         std::vector<std::string> subs;
         if (r.has_status) subs.push_back("status");
         if (r.group.empty() && r.plural == "namespaces") subs.push_back("finalize");
+        if (r.plural == "certificatesigningrequests") subs.push_back("approval");
         if (HasScale(r)) {
             ValueBuilder se(json::Type::kObject);
             se["name"] = r.plural + "/scale";
@@ -130,6 +172,7 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
         if (IsPod(r)) {
             for (const auto& [sub, kind, verbs] : std::vector<std::tuple<std::string, std::string, std::vector<std::string>>>{
                      {"log", "Pod", {"get"}}, {"exec", "PodExecOptions", {"create", "get"}},
+                     {"ephemeralcontainers", "Pod", {"get", "patch", "update"}}, {"resize", "Pod", {"get", "patch", "update"}},
                      {"attach", "PodAttachOptions", {"create", "get"}}, {"portforward", "PodPortForwardOptions", {"create", "get"}}}) {
                 ValueBuilder se(json::Type::kObject);
                 se["name"] = "pods/" + sub;
@@ -179,14 +222,30 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
     return b.ExtractValue();
 }
 
-Value Group(const std::string& name, const std::string& version) {
+Value Group(const Registry& reg, const std::string& name) {
     ValueBuilder g(json::Type::kObject);
     g["name"] = name;
-    ValueBuilder v(json::Type::kObject);
-    v["groupVersion"] = name + "/" + version;
-    v["version"] = version;
-    g["versions"] = std::vector<Value>{v.ExtractValue()};
-    g["preferredVersion"] = g["versions"][0];
+    auto preferred = reg.PreferredVersion(name);
+    ValueBuilder versions(json::Type::kArray);
+    // The preferred version first, as upstream lists them.
+    std::vector<std::string> seen;
+    auto add = [&](const std::string& version) {
+        if (std::find(seen.begin(), seen.end(), version) != seen.end()) return;
+        seen.push_back(version);
+        ValueBuilder v(json::Type::kObject);
+        v["groupVersion"] = name + "/" + version;
+        v["version"] = version;
+        versions.PushBack(v.ExtractValue());
+    };
+    add(preferred);
+    for (const auto& gv : reg.GroupVersions()) {
+        if (gv.starts_with(name + "/")) add(gv.substr(name.size() + 1));
+    }
+    g["versions"] = versions;
+    ValueBuilder pv(json::Type::kObject);
+    pv["groupVersion"] = name + "/" + preferred;
+    pv["version"] = preferred;
+    g["preferredVersion"] = pv;
     return g.ExtractValue();
 }
 
@@ -314,6 +373,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       watch_(context.FindComponent<Watch>()),
       auth_(context.FindComponent<Auth>()),
       services_(context.FindComponent<Services>()),
+      crds_(context.FindComponent<Crds>()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
 
@@ -412,9 +472,12 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         v["kind"] = "APIGroupList";
         v["apiVersion"] = "v1";
         ValueBuilder groups(json::Type::kArray);
+        std::vector<std::string> names;
         for (const auto& gv : registry_.GroupVersions()) {
-            auto slash = gv.find('/');
-            groups.PushBack(Group(gv.substr(0, slash), gv.substr(slash + 1)));
+            auto name = gv.substr(0, gv.find('/'));
+            if (std::find(names.begin(), names.end(), name) != names.end()) continue;
+            names.push_back(name);
+            groups.PushBack(Group(registry_, name));
         }
         v["groups"] = groups;
         return json::ToString(v.ExtractValue());
@@ -422,7 +485,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     if (parts[0] == "apis" && parts.size() == 2) {
         for (const auto& gv : registry_.GroupVersions()) {
             if (gv.starts_with(parts[1] + "/")) {
-                ValueBuilder g(Group(parts[1], gv.substr(parts[1].size() + 1)));
+                ValueBuilder g(Group(registry_, parts[1]));
                 g["kind"] = "APIGroup";
                 g["apiVersion"] = "v1";
                 return json::ToString(g.ExtractValue());
@@ -439,7 +502,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
 
     if (rest.empty()) {
         bool known = false;
-        for (const auto& r : registry_.All()) known = known || r.GroupVersion() == gv;
+        for (const auto* r : registry_.All()) known = known || r->GroupVersion() == gv;
         if (!known) throw ApiError(404, "NotFound", "the server could not find the requested resource");
         return json::ToString(ResourceList(registry_, gv));
     }
@@ -458,7 +521,8 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     if (rest.size() >= 2) t.name = rest[1];
     if (rest.size() == 3) t.sub = rest[2];
     if (!t.sub.empty() && !(t.sub == "status" && r.has_status) && !(t.sub == "finalize" && IsNamespace(r)) &&
-        !(t.sub == "token" && IsServiceAccount(r)) && !(t.sub == "scale" && HasScale(r)) && !((t.sub == "binding" || t.sub == "eviction" || KubeletSub(t.sub)) && IsPod(r))) {
+        !(t.sub == "token" && IsServiceAccount(r)) && !(t.sub == "scale" && HasScale(r)) && !((t.sub == "binding" || t.sub == "eviction" || KubeletSub(t.sub) || t.sub == "ephemeralcontainers" || t.sub == "resize") && IsPod(r)) &&
+        !(t.sub == "approval" && r.plural == "certificatesigningrequests")) {
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
     }
     if (!r.namespaced && !t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
@@ -502,14 +566,18 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             auto [after_ns, after_name] = DecodeContinue(Arg(request, "continue"));
             auto ns = t.ns.empty() && r.namespaced ? fields.Pinned("metadata.namespace") : t.ns;
             auto render = [&](const std::vector<Value>& items, const std::string& rv, const std::string& cont) {
-                if (table) return json::ToString(tables::Make(r, items, true, include_object, rv, cont));
+                if (table) {
+                    std::vector<Value> view;
+                    for (const auto& item : items) view.push_back(ToView(r, item));
+                    return json::ToString(tables::Make(r, view, true, include_object, rv, cont));
+                }
                 ValueBuilder list(json::Type::kObject);
                 list["kind"] = metadata ? "PartialObjectMetadataList" : r.kind + "List";
                 list["apiVersion"] = metadata ? "meta.k8s.io/v1" : r.GroupVersion();
                 list["metadata"]["resourceVersion"] = rv;
                 if (!cont.empty()) list["metadata"]["continue"] = cont;
                 ValueBuilder out(json::Type::kArray);
-                for (const auto& item : items) out.PushBack(metadata ? tables::Metadata(item) : item);
+                for (const auto& item : items) out.PushBack(metadata ? tables::Metadata(item) : ToView(r, item));
                 list["items"] = out;
                 return json::ToString(list.ExtractValue());
             };
@@ -529,9 +597,10 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             );
         }
         if (method == http::HttpMethod::kPost) {
-            auto incoming = ParseBody(request.RequestBody());
+            auto incoming = CheckFields(r, ParseBody(request.RequestBody()), request.RequestBody(), request);
             if (r.namespaced && t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
             auto object = objects::PrepareCreate(r, incoming, t.ns);
+            if (IsDefinitions(r)) Crds::Validate(object);
             auto name = objects::Name(object);
             if (r.namespaced) {
                 auto ns = store_.Get(kNamespaces, "", t.ns);
@@ -541,11 +610,11 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                     throw ApiError(403, "Forbidden", why).About(r.plural, r.group, name).Cause("NamespaceTerminating", why, "metadata.namespace");
                 }
             }
-            object = admission::Admit(store_, r, object);
+            object = ToStorage(r, admission::Admit(store_, r, object));
             if (dry_run) {
                 if (store_.Get(r, t.ns, name)) throw AlreadyExists(r.plural, r.group, name);
                 response.SetStatus(http::HttpStatus::kCreated);
-                return json::ToString(object);
+                return json::ToString(ToView(r, object));
             }
             Services::Change change;
             Decision d;
@@ -560,7 +629,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 throw;
             }
             response.SetStatus(http::HttpStatus::kCreated);
-            return json::ToString(d.object);
+            return json::ToString(ToView(r, d.object));
         }
         if (method == http::HttpMethod::kDelete) {
             auto labels = LabelSelector::Parse(Arg(request, "labelSelector"));
@@ -594,7 +663,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         if (method == http::HttpMethod::kGet) {
             auto obj = store_.Get(r, t.ns, t.name);
             if (!obj) throw NotFound(r.plural, r.group, t.name);
-            return json::ToString(ScaleOf(*obj));
+            return json::ToString(ScaleOf(r, *obj));
         }
         if (method != http::HttpMethod::kPut && method != http::HttpMethod::kPatch) {
             throw MethodNotAllowed("the server does not allow this method on the requested resource");
@@ -603,39 +672,47 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         const auto content_type = request.GetHeader(userver::http::headers::kContentType);
         auto decide = [&](const std::optional<Value>& current) -> Decision {
             if (!current) throw NotFound(r.plural, r.group, t.name);
-            auto scale = method == http::HttpMethod::kPatch ? patch::Apply(content_type, ScaleOf(*current), body) : ParseBody(body);
+            auto scale = method == http::HttpMethod::kPatch ? patch::Apply(content_type, ScaleOf(r, *current), body) : ParseBody(body);
             auto rv = scale["metadata"]["resourceVersion"].As<std::string>("");
             if (method == http::HttpMethod::kPut && !rv.empty()) CheckVersion(r, *current, scale);
             auto replicas = scale["spec"]["replicas"].As<std::int64_t>(0);
             if (replicas < 0) throw Invalid("Scale", "autoscaling", t.name, "spec.replicas: Invalid value: " + std::to_string(replicas) + ": must be greater than or equal to 0");
-            if ((*current)["spec"]["replicas"].As<std::int64_t>(-1) == replicas) return Decision::Keep();
-            ValueBuilder b(*current);
-            b["spec"]["replicas"] = replicas;
+            const auto path = r.custom ? r.custom->spec_replicas : std::string(".spec.replicas");
+            if (AtPath(*current, path).As<std::int64_t>(-1) == replicas) return Decision::Keep();
+            ValueBuilder b(SetAtPath(*current, path, ValueBuilder(replicas).ExtractValue()));
             b["metadata"]["generation"] = (*current)["metadata"]["generation"].As<std::int64_t>(0) + 1;
             return Decision::Put(b.ExtractValue());
         };
-        if (dry_run) return json::ToString(ScaleOf(decide(store_.Get(r, t.ns, t.name)).object));
+        if (dry_run) return json::ToString(ScaleOf(r, decide(store_.Get(r, t.ns, t.name)).object));
         auto d = store_.Write(r, t.ns, t.name, decide);
-        return json::ToString(ScaleOf(d.object));
+        return json::ToString(ScaleOf(r, d.object));
     }
 
     // Single objects.
     if (method == http::HttpMethod::kGet) {
         auto obj = store_.Get(r, t.ns, t.name);
         if (!obj) throw NotFound(r.plural, r.group, t.name);
+        obj = ToView(r, *obj);
         if (table && t.sub.empty()) return json::ToString(tables::Make(r, {*obj}, true, include_object, "", ""));
+        if (t.sub == "scale") return json::ToString(ScaleOf(r, *obj));
         if (metadata && t.sub.empty()) return json::ToString(tables::Metadata(*obj));
         return json::ToString(*obj);
     }
 
     if (method == http::HttpMethod::kPut || method == http::HttpMethod::kPatch) {
-        const bool status_write = t.sub == "status";
+        const bool status_write = t.sub == "status" || t.sub == "approval";
+        // Subresources that write one part of a pod's spec.
+        const char* spec_part = t.sub == "ephemeralcontainers" ? "ephemeralContainers" : t.sub == "resize" ? "containers" : nullptr;
         const bool finalize = t.sub == "finalize";
         const bool is_patch = method == http::HttpMethod::kPatch;
         const auto body = request.RequestBody();
         const auto content_type = request.GetHeader(userver::http::headers::kContentType);
         Services::Change change;
-        auto decide = [&](const std::optional<Value>& current) -> Decision {
+        auto decide = [&](const std::optional<Value>& stored) -> Decision {
+            // A custom resource is patched and checked in the version the
+            // client speaks, and stored in the storage version.
+            std::optional<Value> current;
+            if (stored) current = ToView(r, *stored);
             Value incoming;
             if (is_patch) {
                 if (!current) throw NotFound(r.plural, r.group, t.name);
@@ -650,20 +727,42 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             } else {
                 incoming = ParseBody(body);
             }
+            if (spec_part == nullptr && !finalize) incoming = CheckFields(r, incoming, body, request);
             if (!current) {
                 if (is_patch || status_write || finalize) throw NotFound(r.plural, r.group, t.name);
                 // An update of a missing object creates it, as upstream does for most kinds.
                 auto object = objects::PrepareCreate(r, incoming, t.ns);
                 if (objects::Name(object) != t.name) throw BadRequest("the name of the object does not match the name on the URL");
+                if (IsDefinitions(r)) Crds::Validate(object);
                 if (IsService(r) && !dry_run) object = services_.Assign(object, std::nullopt, change);
-                return Decision::Put(object);
+                return Decision::Put(ToStorage(r, object));
             }
             if (objects::Name(incoming) != t.name && !objects::Name(incoming).empty()) {
                 throw BadRequest("the name of the object does not match the name on the URL");
             }
             CheckVersion(r, *current, incoming);
             Value next;
-            if (finalize) {
+            if (spec_part != nullptr) {
+                ValueBuilder b(*current);
+                if (t.sub == "ephemeralcontainers") {
+                    b["spec"]["ephemeralContainers"] = incoming["spec"]["ephemeralContainers"];
+                } else {
+                    // A resize changes resources only, container by container.
+                    ValueBuilder containers(json::Type::kArray);
+                    for (const auto& c : objects::Items((*current)["spec"]["containers"])) {
+                        ValueBuilder cb(c);
+                        for (const auto& n : objects::Items(incoming["spec"]["containers"])) {
+                            if (n["name"] == c["name"]) {
+                                if (n.HasMember("resources")) cb["resources"] = n["resources"];
+                                if (n.HasMember("resizePolicy")) cb["resizePolicy"] = n["resizePolicy"];
+                            }
+                        }
+                        containers.PushBack(cb.ExtractValue());
+                    }
+                    b["spec"]["containers"] = containers;
+                }
+                next = objects::PrepareUpdate(r, *current, b.ExtractValue(), false);
+            } else if (finalize) {
                 ValueBuilder b(*current);
                 b["spec"]["finalizers"] = incoming["spec"]["finalizers"].IsMissing()
                                               ? ValueBuilder(json::Type::kArray)
@@ -671,14 +770,16 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 next = b.ExtractValue();
             } else {
                 next = objects::PrepareUpdate(r, *current, incoming, status_write);
+                if (IsDefinitions(r) && !status_write) Crds::Validate(next);
                 if (IsService(r) && !status_write && !dry_run) next = services_.Assign(next, current, change);
             }
-            if (next == *current) return Decision::Keep();
+            next = ToStorage(r, next);
+            if (next == *stored) return Decision::Keep();
             return Releasable(r, next) ? Decision::Remove(next) : Decision::Put(next);
         };
         if (dry_run) {
             auto d = decide(store_.Get(r, t.ns, t.name));
-            return json::ToString(d.object);
+            return json::ToString(ToView(r, d.object));
         }
         Decision d;
         try {
@@ -689,7 +790,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         }
         services_.Commit(change, t.ns, t.name);
         if (IsService(r) && d.action == Decision::Action::kRemove) services_.Release(d.object);
-        return json::ToString(d.object);
+        return json::ToString(ToView(r, d.object));
     }
 
     if (method == http::HttpMethod::kDelete) {
@@ -741,7 +842,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         if (d.action == Decision::Action::kRemove && !IsPod(r) && !r.has_status) {
             return json::ToString(SuccessStatus());
         }
-        return json::ToString(d.object);
+        return json::ToString(ToView(r, d.object));
     }
 
     throw MethodNotAllowed("the server does not allow this method on the requested resource");
@@ -870,6 +971,45 @@ std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns
     std::string body, piece;
     while (conn->ReadBody(piece, deadline)) body += piece;
     return body;
+}
+
+Value Api::ToView(const Resource& r, const Value& object) const {
+    if (!r.custom || r.version == r.custom->storage_version) return object;
+    return crds_.Convert(r, object, r.version);
+}
+
+Value Api::ToStorage(const Resource& r, const Value& object) const {
+    if (!r.custom || r.version == r.custom->storage_version) return object;
+    return crds_.Convert(r, object, r.custom->storage_version);
+}
+
+Value Api::CheckFields(const Resource& r, const Value& object, const std::string& body, const http::HttpRequest& request) const {
+    auto mode = Arg(request, "fieldValidation");
+    if (mode.empty()) mode = "Warn";
+    schema::Findings findings;
+    Value out = object;
+    if (auto s = crds_.SchemaFor(r); s && object.IsObject()) out = s->Apply(object, findings);
+    if (!findings.problems.empty()) {
+        throw Invalid(r.kind, r.group, objects::Name(object), schema::Message(findings.problems));
+    }
+    if (mode == "Ignore") return out;
+    std::vector<std::string> issues;
+    for (const auto& d : schema::DuplicateFields(body)) issues.push_back("duplicate field \"" + d + "\"");
+    for (const auto& u : findings.unknown) issues.push_back("unknown field \"" + u + "\"");
+    if (issues.empty()) return out;
+    if (mode == "Strict") {
+        std::string message = "strict decoding error: ";
+        for (std::size_t i = 0; i < issues.size(); ++i) message += (i ? ", " : "") + issues[i];
+        throw BadRequest(message);
+    }
+    std::string warning;
+    for (const auto& issue : issues) {
+        std::string quoted;
+        for (char c : issue) quoted += c == '"' ? std::string("\\\"") : std::string(1, c);
+        warning += (warning.empty() ? "" : ", ") + std::string("299 - \"") + quoted + "\"";
+    }
+    request.GetHttpResponse().SetHeader(std::string("Warning"), warning);
+    return out;
 }
 
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
@@ -1064,7 +1204,13 @@ void Api::HandleStreamRequest(
         const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
         const auto include_object = Arg(request, "includeObject");
         bool columns_sent = false;
-        auto send = [&](const Value& event) {
+        auto send = [&](const Value& raw) {
+            Value event = raw;
+            if (r.custom && raw["type"].As<std::string>("") != "ERROR" && raw["type"].As<std::string>("") != "BOOKMARK") {
+                ValueBuilder b(raw);
+                b["object"] = ToView(r, raw["object"]);
+                event = b.ExtractValue();
+            }
             if (metadata && event["type"].As<std::string>("") != "ERROR") {
                 ValueBuilder b(event);
                 b["object"] = tables::Metadata(event["object"]);

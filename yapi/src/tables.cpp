@@ -2,6 +2,7 @@
 
 #include <ctime>
 #include <functional>
+#include <set>
 
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/serialize/common_containers.hpp>
@@ -124,9 +125,81 @@ std::string PodStatus(const Value& pod) {
     return reason;
 }
 
+// Enough of kubectl's JSONPath for printer columns: fields, indexes, [*]
+// and [?(@.field=="value")] filters. The first match is the cell.
+Value JsonPath(const Value& root, const std::string& path) {
+    std::vector<Value> current{root};
+    std::size_t i = 0;
+    auto p = path;
+    if (p.starts_with("{") && p.ends_with("}")) p = p.substr(1, p.size() - 2);
+    while (i < p.size() && !current.empty()) {
+        std::vector<Value> next;
+        if (p[i] == '.') {
+            ++i;
+            std::size_t end = p.find_first_of(".[", i);
+            auto field = p.substr(i, end == std::string::npos ? std::string::npos : end - i);
+            i = end == std::string::npos ? p.size() : end;
+            for (const auto& v : current) {
+                if (v.IsObject() && v.HasMember(field)) next.push_back(v[field]);
+            }
+        } else if (p[i] == '[') {
+            auto close = p.find(']', i);
+            if (close == std::string::npos) break;
+            auto inner = p.substr(i + 1, close - i - 1);
+            i = close + 1;
+            for (const auto& v : current) {
+                if (!v.IsArray()) continue;
+                if (inner == "*") {
+                    for (const auto& item : v) next.push_back(item);
+                } else if (inner.starts_with("?(@.")) {
+                    auto eq = inner.find("==");
+                    if (eq == std::string::npos) continue;
+                    auto field = inner.substr(4, eq - 4);
+                    auto want = inner.substr(eq + 2);
+                    if (!want.empty() && want.back() == ')') want.pop_back();
+                    if (want.size() >= 2 && (want.front() == '"' || want.front() == '\'')) want = want.substr(1, want.size() - 2);
+                    for (const auto& item : v) {
+                        if (item.IsObject() && item.HasMember(field) && item[field].IsString() && item[field].As<std::string>() == want) {
+                            next.push_back(item);
+                        }
+                    }
+                } else {
+                    try {
+                        auto idx = std::stol(inner);
+                        if (idx < 0) idx += static_cast<long>(v.GetSize());
+                        if (idx >= 0 && static_cast<std::size_t>(idx) < v.GetSize()) next.push_back(v[idx]);
+                    } catch (const std::exception&) {
+                    }
+                }
+            }
+        } else {
+            break;
+        }
+        current = std::move(next);
+    }
+    return current.empty() ? Value() : current.front();
+}
+
 std::vector<Column> Columns(const Resource& r) {
     const Column name{"Name", "string", "name", 0, [](const Value& o) { return V(objects::Name(o)); }};
     const Column age{"Age", "string", "", 0, [](const Value& o) { return V(Since(o["metadata"]["creationTimestamp"])); }};
+    if (r.custom) {
+        // A definition's printer columns, the way upstream renders them.
+        std::vector<Column> cols{name};
+        for (const auto& c : objects::Items(r.custom->printer_columns)) {
+            auto path = c["jsonPath"].As<std::string>("");
+            auto type = c["type"].As<std::string>("string");
+            cols.push_back({c["name"].As<std::string>(""), type, c["format"].As<std::string>(""), c["priority"].As<int>(0),
+                            [path, type](const Value& o) {
+                                auto v = JsonPath(o, path);
+                                if (v.IsMissing() || v.IsNull()) return Value();
+                                if (type == "date" && v.IsString()) return V(Since(v));
+                                return v;
+                            }});
+        }
+        cols.push_back(age);
+        return cols;
+    }
     const auto& k = r.plural;
     const bool core = r.group.empty();
 
@@ -341,13 +414,13 @@ std::vector<Column> Columns(const Resource& r) {
             name,
             {"Status", "string", "", 0,
              [](const Value& o) {
+                 // Terminal conditions win over the ones on the way there.
+                 std::set<std::string> on;
                  for (const auto& c : objects::Items(o["status"]["conditions"])) {
-                     if (Str(c["status"]) != "True") continue;
-                     auto t = Str(c["type"]);
-                     if (t == "Complete") return V("Complete");
-                     if (t == "Failed") return V("Failed");
-                     if (t == "FailureTarget") return V("FailureTarget");
-                     if (t == "Suspended") return V("Suspended");
+                     if (Str(c["status"]) == "True") on.insert(Str(c["type"]));
+                 }
+                 for (const char* t : {"Complete", "Failed", "FailureTarget", "SuccessCriteriaMet", "Suspended"}) {
+                     if (on.count(t)) return V(t);
                  }
                  return V("Running");
              }},

@@ -67,6 +67,9 @@ components_manager:
             advertise-address#fallback: ''
             advertise-port: $port
             advertise-port#fallback: 6443
+        yapi-crds:
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
         yapi-protobuf:
             proto-dir: $proto-dir
             proto-dir#fallback: /usr/share/yapi/proto
