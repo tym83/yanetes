@@ -779,7 +779,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             }
             auto page = store_.List(r, ns, limit, after_ns, after_name);
             for (auto& item : page.items) {
-                if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) found.push_back(std::move(item));
+                if (labels.Matches(item["metadata"]["labels"]) && FieldsMatch(r, fields, item)) found.push_back(std::move(item));
             }
             // Pages after the first report the revision of the first.
             const auto rv = cont.rv > 0 ? static_cast<std::uint64_t>(cont.rv) : page.rv;
@@ -845,7 +845,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             list["apiVersion"] = r.GroupVersion();
             list["items"] = ValueBuilder(json::Type::kArray);
             for (const auto& item : page.items) {
-                if (!labels.Matches(item["metadata"]["labels"]) || !fields.Matches(item)) continue;
+                if (!labels.Matches(item["metadata"]["labels"]) || !FieldsMatch(r, fields, item)) continue;
                 auto d = store_.Write(r, objects::Namespace(item), objects::Name(item), [&](const std::optional<Value>& cur) {
                     if (!cur) return Decision::Keep();
                     ValueBuilder b(*cur);
@@ -1321,6 +1321,13 @@ void Api::Warn(const http::HttpRequest& request, const std::vector<std::string>&
     request.GetHttpResponse().SetHeader(std::string("Warning"), header);
 }
 
+bool Api::FieldsMatch(const Resource& r, const FieldSelector& fields, const Value& stored) const {
+    // Selectable fields of a custom resource are paths of the version asked
+    // for, so the object is matched as that version shows it.
+    if (fields.Empty()) return true;
+    return fields.Matches(r.custom ? ToView(r, stored) : stored);
+}
+
 Value Api::ToView(const Resource& r, const Value& object) const {
     if (conversion::Converted(r)) return conversion::ToServed(r, object);
     if (!r.custom || !object.IsObject()) return object;
@@ -1356,6 +1363,21 @@ Value Api::CheckFields(const Resource& r, const Value& object, const bodies::Par
         throw Invalid(r.kind, r.group, objects::Name(object), schema::Message(findings.problems));
     }
     if (mode == "Ignore") return out;
+    if (mode == "Strict" && !findings.unknown.empty() && request.GetHeader(userver::http::headers::kContentType).starts_with("application/apply-patch")) {
+        // Apply reports unknown fields as the typed patch upstream builds
+        // from the schema does.
+        std::vector<std::string> errors;
+        for (const auto& u : findings.unknown) errors.push_back("." + u + ": field not declared in schema");
+        std::string message = "failed to create typed patch object (" + objects::Namespace(object) + "/" + objects::Name(object) + "; " +
+                              r.GroupVersion() + ", Kind=" + r.kind + "): ";
+        if (errors.size() == 1) {
+            message += errors[0];
+        } else {
+            message += "errors:";
+            for (const auto& e : errors) message += "\n  " + e;
+        }
+        throw ApiError(500, "InternalError", message);
+    }
     std::vector<std::string> issues;
     for (const auto& u : findings.unknown) issues.push_back("unknown field \"" + u + "\"");
     for (const auto& d : parsed.duplicate_fields) issues.push_back("duplicate field \"" + d + "\"");
@@ -1722,7 +1744,7 @@ void Api::HandleStreamRequest(
         );
         auto deadline = userver::engine::Deadline::FromDuration(timeout);
         auto matches = [&](const std::string& event_ns, const Value& object) {
-            return (ns.empty() || event_ns == ns) && labels.Matches(object["metadata"]["labels"]) && fields.Matches(object);
+            return (ns.empty() || event_ns == ns) && labels.Matches(object["metadata"]["labels"]) && FieldsMatch(r, fields, object);
         };
 
         // With a selector, an object that stops matching leaves the watch

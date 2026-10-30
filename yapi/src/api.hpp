@@ -9,6 +9,7 @@
 #include <userver/server/handlers/http_handler_base.hpp>
 
 #include <registry.hpp>
+#include <selectors.hpp>
 
 namespace yapi {
 
@@ -65,6 +66,7 @@ private:
     ) const;
     // Custom resources: the object as the client's version shows it, and as stored.
     userver::formats::json::Value ToView(const Resource& r, const userver::formats::json::Value& object) const;
+    bool FieldsMatch(const Resource& r, const FieldSelector& fields, const userver::formats::json::Value& stored) const;
     userver::formats::json::Value ToStorage(const Resource& r, const userver::formats::json::Value& object) const;
     // Prunes and checks fields as the request's fieldValidation asks.
     userver::formats::json::Value CheckFields(const Resource& r, const userver::formats::json::Value& object,

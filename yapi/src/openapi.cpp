@@ -35,22 +35,101 @@ Value Parse(const std::string& text) {
     }
 }
 
-// A custom resource's schema as a published definition: its own fields,
-// the standard ones every object has, and the kind it belongs to.
-Value Definition(const Resource& r, const std::string& meta_ref) {
-    ValueBuilder d(r.custom->schema.IsObject() ? r.custom->schema : ValueBuilder(json::Type::kObject).ExtractValue());
-    if (!d.HasMember("type")) d["type"] = "object";
+bool Preserves(const Value& schema) { return schema["x-kubernetes-preserve-unknown-fields"].As<bool>(false); }
+
+// What OpenAPI v2 cannot say, taken out as upstream's ToStructuralOpenAPIV2
+// does: kubectl would refuse fields a v2 schema does not list.
+Value ToV2(const Value& schema) {
+    if (!schema.IsObject()) return schema;
+    ValueBuilder s(schema);
+    for (const char* k : {"allOf", "oneOf", "anyOf", "not"}) s.Remove(k);
+    bool drop_children = false;
+    if (schema["nullable"].As<bool>(false)) {
+        s.Remove("type");
+        s.Remove("nullable");
+        drop_children = true;
+    }
+    if (Preserves(schema)) drop_children = true;
+    if (drop_children) {
+        s.Remove("items");
+        s.Remove("properties");
+    }
+    const auto type = drop_children && schema["nullable"].As<bool>(false) ? std::string() : schema["type"].As<std::string>("");
+    if ((type == "array" && (drop_children || !schema.HasMember("items"))) || (type == "object" && Preserves(schema))) s.Remove("type");
+    if (!drop_children) {
+        if (schema["properties"].IsObject()) {
+            std::vector<Value> required;
+            for (const auto& name : objects::Items(schema["required"])) {
+                if (!schema["properties"][name.As<std::string>("")]["nullable"].As<bool>(false)) required.push_back(name);
+            }
+            if (schema.HasMember("required")) {
+                if (required.empty()) {
+                    s.Remove("required");
+                } else {
+                    s["required"] = required;
+                }
+            }
+            for (auto it = schema["properties"].begin(); it != schema["properties"].end(); ++it) s["properties"][it.GetName()] = ToV2(*it);
+        }
+        if (schema["items"].IsObject()) s["items"] = ToV2(schema["items"]);
+    }
+    if (schema["additionalProperties"].IsObject()) {
+        if (schema["additionalProperties"]["nullable"].As<bool>(false)) s.Remove("required");
+        s["additionalProperties"] = ToV2(schema["additionalProperties"]);
+    }
+    return s.ExtractValue();
+}
+
+void TypeMeta(ValueBuilder& d) {
     ValueBuilder api_version(json::Type::kObject);
     api_version["type"] = "string";
     api_version["description"] = "APIVersion defines the versioned schema of this representation of an object.";
     ValueBuilder kind(json::Type::kObject);
     kind["type"] = "string";
     kind["description"] = "Kind is a string value representing the REST resource this object represents.";
-    ValueBuilder meta(json::Type::kObject);
-    meta["$ref"] = meta_ref;
-    if (!d["properties"].HasMember("apiVersion")) d["properties"]["apiVersion"] = api_version;
-    if (!d["properties"].HasMember("kind")) d["properties"]["kind"] = kind;
-    d["properties"]["metadata"] = meta;
+    d["properties"]["apiVersion"] = api_version;
+    d["properties"]["kind"] = kind;
+}
+
+// Embedded resources get the fields every object has, as at the root.
+Value Embedded(const Value& schema, const std::string& meta_ref, bool v2) {
+    if (!schema.IsObject()) return schema;
+    ValueBuilder s(schema);
+    if (schema["properties"].IsObject()) {
+        for (auto it = schema["properties"].begin(); it != schema["properties"].end(); ++it) {
+            s["properties"][it.GetName()] = Embedded(*it, meta_ref, v2);
+        }
+    }
+    if (schema["items"].IsObject()) s["items"] = Embedded(schema["items"], meta_ref, v2);
+    if (schema["additionalProperties"].IsObject()) s["additionalProperties"] = Embedded(schema["additionalProperties"], meta_ref, v2);
+    if (schema["x-kubernetes-embedded-resource"].As<bool>(false) && !(v2 && Preserves(schema))) {
+        TypeMeta(s);
+        ValueBuilder meta(json::Type::kObject);
+        meta["$ref"] = meta_ref;
+        s["properties"]["metadata"] = meta;
+    }
+    return s.ExtractValue();
+}
+
+// A custom resource's schema as a published definition: its own fields,
+// the standard ones every object has, and the kind it belongs to.
+Value Definition(const Resource& r, const std::string& meta_ref, bool v2) {
+    const auto& schema = r.custom->schema;
+    ValueBuilder d(json::Type::kObject);
+    if (!schema.IsObject() || (v2 && Preserves(schema))) {
+        // Nothing more: kubectl would refuse whatever is not listed.
+        d["type"] = "object";
+    } else {
+        d = ValueBuilder(Embedded(v2 ? ToV2(schema) : schema, meta_ref, v2));
+        TypeMeta(d);
+        // A v3 reference takes no siblings: the description goes beside allOf.
+        ValueBuilder ref(json::Type::kObject);
+        ref["$ref"] = meta_ref;
+        ValueBuilder meta(v2 ? ref.ExtractValue() : ValueBuilder(json::Type::kObject).ExtractValue());
+        if (!v2) meta["allOf"] = std::vector<Value>{ref.ExtractValue()};
+        meta["description"] = "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata";
+        d["properties"]["metadata"] = meta;
+    }
     ValueBuilder gvk(json::Type::kObject);
     gvk["group"] = r.group;
     gvk["version"] = r.version;
@@ -88,7 +167,7 @@ std::string Documents::V2(const Registry& registry) const {
     if (custom.empty()) return v2_.IsMissing() ? std::string() : json::ToString(v2_);
     ValueBuilder doc(v2_.IsObject() ? v2_ : ValueBuilder(json::Type::kObject).ExtractValue());
     for (const auto* r : custom) {
-        doc["definitions"][DefinitionName(*r)] = Definition(*r, "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta");
+        doc["definitions"][DefinitionName(*r)] = Definition(*r, "#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta", true);
     }
     return json::ToString(doc.ExtractValue());
 }
@@ -134,7 +213,7 @@ std::optional<std::string> Documents::V3(const Registry& registry, const std::st
     }
     for (const auto* r : mine) {
         doc["components"]["schemas"][DefinitionName(*r)] =
-            Definition(*r, "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta");
+            Definition(*r, "#/components/schemas/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta", false);
         // kubectl explain finds a kind by a path that serves it.
         auto base = "/apis/" + r->group + "/" + r->version + (r->namespaced ? "/namespaces/{namespace}/" : "/") + r->plural;
         ValueBuilder ref(json::Type::kObject);
@@ -150,6 +229,16 @@ std::optional<std::string> Documents::V3(const Registry& registry, const std::st
         gvk["kind"] = r->kind;
         op["x-kubernetes-group-version-kind"] = gvk;
         doc["paths"][base + "/{name}"]["get"] = op;
+        // kubectl checks a kind takes fieldValidation by its patch operation.
+        ValueBuilder patch(op.ExtractValue());
+        patch["operationId"] = "patch" + r->kind;
+        patch["x-kubernetes-action"] = "patch";
+        ValueBuilder param(json::Type::kObject);
+        param["name"] = "fieldValidation";
+        param["in"] = "query";
+        param["schema"]["type"] = "string";
+        patch["parameters"] = std::vector<Value>{param.ExtractValue()};
+        doc["paths"][base + "/{name}"]["patch"] = patch;
     }
     return json::ToString(doc.ExtractValue());
 }

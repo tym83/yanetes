@@ -1,9 +1,10 @@
 // protohints lists what protobuf alone does not tell about the Kubernetes
 // API types, one "message.field" a line, for yapi's protobuf decoder:
 //
-//   - pointer-fields.txt: scalar fields behind a pointer (*string, *int32,
-//     *bool, ...), where "", 0 and false are values: protobuf writes every
-//     other scalar even when it is zero, where JSON leaves it out;
+//   - pointer-fields.txt: scalar fields whose zero JSON keeps: those behind
+//     a pointer (*string, *int32, *bool, ...), where "", 0 and false are
+//     values, and plain ones without omitempty; protobuf writes every other
+//     scalar even when it is zero, where JSON leaves it out;
 //
 //   - inline-fields.txt: embedded structs JSON inlines (Volume's
 //     VolumeSource), which protobuf keeps as a field of their own;
@@ -92,6 +93,12 @@ func main() {
 						if id, ok := star.X.(*ast.Ident); ok && scalar[id.Name] {
 							pointers = append(pointers, pkg+"."+ts.Name.Name+"."+name)
 						}
+					}
+					// A plain scalar JSON always writes, zero or not: a CRD
+					// version's "served": false.
+					if id, ok := field.Type.(*ast.Ident); ok && scalar[id.Name] && jsonName != "" && jsonName != "-" &&
+						!strings.Contains(reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Get("json"), "omitempty") {
+						pointers = append(pointers, pkg+"."+ts.Name.Name+"."+name)
 					}
 				}
 				return true
