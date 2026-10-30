@@ -36,6 +36,7 @@
 #include <status.hpp>
 #include <store.hpp>
 #include <tables.hpp>
+#include <webhooks.hpp>
 #include <watch.hpp>
 
 namespace yapi {
@@ -374,6 +375,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       auth_(context.FindComponent<Auth>()),
       services_(context.FindComponent<Services>()),
       crds_(context.FindComponent<Crds>()),
+      webhooks_(context.FindComponent<Webhooks>()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
 
@@ -539,7 +541,21 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         response.SetStatus(http::HttpStatus::kCreated);
         return Review(r, request, *user);
     }
-    if (IsPod(r) && KubeletSub(t.sub)) return Kubelet(request, t.ns, t.name, t.sub);
+    if (IsPod(r) && KubeletSub(t.sub)) {
+        if (t.sub != "log" && webhooks_.Interested(r, t.sub, "CONNECT")) {
+            // What the client asked for, as the options kind of the subresource.
+            ValueBuilder opts(json::Type::kObject);
+            opts["kind"] = t.sub == "exec" ? "PodExecOptions" : t.sub == "attach" ? "PodAttachOptions" : "PodPortForwardOptions";
+            opts["apiVersion"] = "v1";
+            for (const char* flag : {"stdin", "stdout", "stderr", "tty"}) {
+                if (request.HasArg(flag)) opts[flag] = Flag(request, flag);
+            }
+            if (request.HasArg("container")) opts["container"] = Arg(request, "container");
+            if (request.HasArg("command")) opts["command"] = request.GetArgVector("command");
+            webhooks_.Validate({&r, t.sub, "CONNECT", t.ns, t.name, opts.ExtractValue(), Value(), Value(), &*user, dry_run});
+        }
+        return Kubelet(request, t.ns, t.name, t.sub);
+    }
     if (t.sub == "binding" || t.sub == "eviction") {
         if (method != http::HttpMethod::kPost) throw MethodNotAllowed("the server does not allow this method on the requested resource");
         auto body = ParseBody(request.RequestBody());
@@ -610,7 +626,14 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                     throw ApiError(403, "Forbidden", why).About(r.plural, r.group, name).Cause("NamespaceTerminating", why, "metadata.namespace");
                 }
             }
-            object = ToStorage(r, admission::Admit(store_, r, object));
+            object = admission::Admit(store_, r, object);
+            {
+                Webhooks::Request wr{&r, "", "CREATE", t.ns, name, object, Value(), Value(), &*user, dry_run};
+                object = webhooks_.Mutate(wr);
+                wr.object = object;
+                webhooks_.Validate(wr);
+            }
+            object = ToStorage(r, object);
             if (dry_run) {
                 if (store_.Get(r, t.ns, name)) throw AlreadyExists(r.plural, r.group, name);
                 response.SetStatus(http::HttpStatus::kCreated);
@@ -777,6 +800,44 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             if (next == *stored) return Decision::Keep();
             return Releasable(r, next) ? Decision::Remove(next) : Decision::Put(next);
         };
+        if (webhooks_.Interested(r, t.sub, "UPDATE") || webhooks_.Interested(r, t.sub, "CREATE")) {
+            // Webhooks are called outside the store's transaction: read,
+            // decide, ask them, then write only if nobody wrote in between.
+            for (int attempt = 0; attempt < 8; ++attempt) {
+                auto stored = store_.Get(r, t.ns, t.name);
+                auto d = decide(stored);
+                if (d.action == Decision::Action::kKeep) return json::ToString(ToView(r, stored ? *stored : d.object));
+                Webhooks::Request wr{&r, t.sub, stored ? "UPDATE" : "CREATE", t.ns, t.name, ToView(r, d.object),
+                                     stored ? ToView(r, *stored) : Value(), Value(), &*user, dry_run};
+                auto mutated = webhooks_.Mutate(wr);
+                wr.object = mutated;
+                webhooks_.Validate(wr);
+                if (dry_run) return json::ToString(mutated);
+                auto final_object = ToStorage(r, mutated);
+                const auto seen = stored ? (*stored)["metadata"]["resourceVersion"].As<std::string>("") : std::string();
+                bool raced = false;
+                Decision written;
+                try {
+                    written = store_.Write(r, t.ns, t.name, [&](const std::optional<Value>& now) -> Decision {
+                        auto now_rv = now ? (*now)["metadata"]["resourceVersion"].As<std::string>("") : std::string();
+                        if (now_rv != seen || now.has_value() != stored.has_value()) {
+                            raced = true;
+                            return Decision::Keep();
+                        }
+                        if (d.action == Decision::Action::kRemove) return Decision::Remove(final_object);
+                        return Decision::Put(final_object);
+                    });
+                } catch (...) {
+                    services_.Undo(change, t.ns, t.name);
+                    throw;
+                }
+                if (raced) continue;
+                services_.Commit(change, t.ns, t.name);
+                if (IsService(r) && written.action == Decision::Action::kRemove) services_.Release(written.object);
+                return json::ToString(ToView(r, written.object));
+            }
+            throw Conflict(r.plural, r.group, t.name, "the object kept changing while admission webhooks looked at it; try again");
+        }
         if (dry_run) {
             auto d = decide(store_.Get(r, t.ns, t.name));
             return json::ToString(ToView(r, d.object));
@@ -795,6 +856,11 @@ std::string Api::Handle(const http::HttpRequest& request) const {
 
     if (method == http::HttpMethod::kDelete) {
         auto options = ParseBody(request.RequestBody());
+        if (webhooks_.Interested(r, t.sub, "DELETE")) {
+            auto stored = store_.Get(r, t.ns, t.name);
+            if (!stored) throw NotFound(r.plural, r.group, t.name);
+            webhooks_.Validate({&r, t.sub, "DELETE", t.ns, t.name, Value(), ToView(r, *stored), options, &*user, dry_run});
+        }
         auto decide = [&](const std::optional<Value>& current) -> Decision {
             if (!current) throw NotFound(r.plural, r.group, t.name);
             if (options.IsObject() && options.HasMember("preconditions")) {
@@ -877,6 +943,38 @@ void Api::Bind(const std::string& ns, const std::string& name, const std::string
 
 void Api::Evict(const std::string& ns, const std::string& name, const Value& options) const {
     const auto& pods = *registry_.Find("", "v1", "pods");
+    auto pod = store_.Get(pods, ns, name);
+    if (!pod) throw NotFound("pods", "", name);
+    // A disruption budget that covers the pod must allow one more disruption,
+    // and counts this one before the pod goes.
+    const auto phase = (*pod)["status"]["phase"].As<std::string>("");
+    if (!objects::Deleting(*pod) && phase != "Succeeded" && phase != "Failed" && phase != "Pending") {
+        const auto& pdbs = *registry_.Find("policy", "v1", "poddisruptionbudgets");
+        for (const auto& pdb : store_.List(pdbs, ns, 0, "", "").items) {
+            auto sel = tables::SelectorString(pdb["spec"]["selector"]);
+            if (sel.empty() || !LabelSelector::Parse(sel).Matches((*pod)["metadata"]["labels"])) continue;
+            bool refused = false;
+            store_.Write(pdbs, ns, objects::Name(pdb), [&](const std::optional<Value>& current) {
+                if (!current) return Decision::Keep();
+                auto allowed = (*current)["status"]["disruptionsAllowed"].As<std::int64_t>(0);
+                if (allowed <= 0 || (*current)["status"]["observedGeneration"].As<std::int64_t>(-1) <
+                                        (*current)["metadata"]["generation"].As<std::int64_t>(0)) {
+                    refused = true;
+                    return Decision::Keep();
+                }
+                ValueBuilder b(*current);
+                b["status"]["disruptionsAllowed"] = allowed - 1;
+                b["status"]["disruptedPods"][name] = objects::Now();
+                return Decision::Put(b.ExtractValue());
+            });
+            if (refused) {
+                throw ApiError(429, "TooManyRequests", "Cannot evict pod as it would violate the pod's disruption budget.")
+                    .Cause("DisruptionBudget", "The disruption budget " + objects::Name(pdb) + " needs " +
+                           std::to_string(pdb["status"]["desiredHealthy"].As<std::int64_t>(0)) + " healthy pods and has " +
+                           std::to_string(pdb["status"]["currentHealthy"].As<std::int64_t>(0)) + " currently");
+            }
+        }
+    }
     store_.Write(pods, ns, name, [&](const std::optional<Value>& current) {
         if (!current) throw NotFound("pods", "", name);
         if (objects::Deleting(*current)) return Decision::Keep();
@@ -974,12 +1072,16 @@ std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns
 }
 
 Value Api::ToView(const Resource& r, const Value& object) const {
-    if (!r.custom || r.version == r.custom->storage_version) return object;
+    if (!r.custom || !object.IsObject() || object["apiVersion"].As<std::string>("") == r.GroupVersion()) return object;
+    if (r.custom->webhook_conversion) return webhooks_.Convert(*r.custom, {object}, r.GroupVersion()).front();
     return crds_.Convert(r, object, r.version);
 }
 
 Value Api::ToStorage(const Resource& r, const Value& object) const {
-    if (!r.custom || r.version == r.custom->storage_version) return object;
+    if (!r.custom || !object.IsObject()) return object;
+    const auto storage = r.group + "/" + r.custom->storage_version;
+    if (object["apiVersion"].As<std::string>("") == storage) return object;
+    if (r.custom->webhook_conversion) return webhooks_.Convert(*r.custom, {object}, storage).front();
     return crds_.Convert(r, object, r.custom->storage_version);
 }
 

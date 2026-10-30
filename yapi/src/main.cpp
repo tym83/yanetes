@@ -1,5 +1,7 @@
 #include <userver/components/component_base.hpp>
 #include <userver/components/component_context.hpp>
+#include <userver/clients/dns/component.hpp>
+#include <userver/clients/http/component_list.hpp>
 #include <userver/components/minimal_server_component_list.hpp>
 #include <userver/storages/secdist/component.hpp>
 #include <userver/storages/secdist/provider_component.hpp>
@@ -12,6 +14,7 @@
 #include <api.hpp>
 #include <auth.hpp>
 #include <crds.hpp>
+#include <webhooks.hpp>
 #include <objects.hpp>
 #include <proto.hpp>
 #include <registry.hpp>
@@ -96,6 +99,9 @@ int main(int argc, char* argv[]) {
                     .Append<yapi::Auth>()
                     .Append<yapi::Services>()
                     .Append<yapi::Crds>()
+                    .Append<userver::clients::dns::Component>()
+                    .AppendComponentList(userver::clients::http::ComponentList())
+                    .Append<yapi::Webhooks>()
                     .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.
     for (const char* name : {"api-0", "api-1", "api-2", "api-3", "api-4", "api-5", "api-6", "api-7", "api-8",

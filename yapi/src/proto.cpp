@@ -28,10 +28,11 @@ namespace {
 
 std::atomic<const Decoder*> g_instance{nullptr};
 
-// *string fields of the API types, as message.field: protobuf writes a
-// *string set to "" just as it writes an empty string, and only for these
-// "" means something (storageClassName "" turns provisioning off).
-std::unordered_set<std::string> g_pointer_strings;
+// Scalar fields of the API types behind a pointer, as message.field. Go's
+// protobuf writes every other scalar even when it is zero, where JSON
+// leaves it out; only for these is "", 0 or false a value (storageClassName
+// "" turns provisioning off, replicas 0 is not one).
+std::unordered_set<std::string> g_pointer_fields;
 // Embedded structs JSON inlines and protobuf keeps as fields of their own:
 // a Volume's VolumeSource, a Probe's handler.
 std::unordered_set<std::string> g_inline_fields;
@@ -160,8 +161,11 @@ json::Value Convert(const pb::Message& m) {
             auto v = Scalar(m, r, f, -1);
             // Go writes every plain string field, JSON omits the empty ones:
             // an empty imagePullPolicy is not a policy.
-            if (v.IsString() && f->type() == pb::FieldDescriptor::TYPE_STRING && v.As<std::string>().empty() &&
-                !g_pointer_strings.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
+            const bool zero = (v.IsString() && f->type() == pb::FieldDescriptor::TYPE_STRING && v.As<std::string>().empty()) ||
+                              (v.IsBool() && !v.As<bool>()) || ((v.IsInt64() || v.IsUInt64() || v.IsInt()) && v.As<std::int64_t>() == 0) ||
+                              (v.IsDouble() && v.As<double>() == 0);
+            if (zero && f->cpp_type() != pb::FieldDescriptor::CPPTYPE_MESSAGE &&
+                !g_pointer_fields.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
                 continue;
             }
             if (!v.IsNull() && !v.IsMissing()) out[std::string(f->name())] = v;
@@ -202,14 +206,14 @@ Decoder::Decoder(const std::string& proto_dir) : impl_(std::make_unique<Impl>())
         auto rel = std::filesystem::relative(entry.path(), proto_dir).string();
         if (impl_->importer.Import(rel)) ++loaded;
     }
-    for (auto [file, set] : {std::pair{"/pointer-strings.txt", &g_pointer_strings}, std::pair{"/inline-fields.txt", &g_inline_fields}}) {
+    for (auto [file, set] : {std::pair{"/pointer-fields.txt", &g_pointer_fields}, std::pair{"/inline-fields.txt", &g_inline_fields}}) {
         std::ifstream in(proto_dir + file);
         for (std::string line; std::getline(in, line);) {
             if (!line.empty()) set->insert(line);
         }
     }
-    LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir << ", " << g_pointer_strings.size()
-               << " pointer string fields, " << g_inline_fields.size() << " inline fields";
+    LOG_INFO() << "protobuf: loaded " << loaded << " files from " << proto_dir << ", " << g_pointer_fields.size()
+               << " pointer fields, " << g_inline_fields.size() << " inline fields";
 }
 
 Decoder::~Decoder() = default;

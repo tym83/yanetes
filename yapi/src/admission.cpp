@@ -4,7 +4,11 @@
 #include <userver/formats/serialize/common_containers.hpp>
 #include <userver/utils/rand.hpp>
 
+#include <map>
+#include <set>
+
 #include <objects.hpp>
+#include <quantity.hpp>
 #include <status.hpp>
 #include <store.hpp>
 
@@ -171,6 +175,260 @@ Value NodeTaints(Value node) {
     return b.ExtractValue();
 }
 
+
+// What a container asks for, as a resource list: requests and limits.
+using Amounts = std::map<std::string, long double>;
+
+Amounts AmountsOf(const Value& list) {
+    Amounts out;
+    if (!list.IsObject()) return out;
+    for (auto it = list.begin(); it != list.end(); ++it) {
+        if (auto q = quantity::Parse(it->As<std::string>(""))) out[it.GetName()] = *q;
+    }
+    return out;
+}
+
+bool Binary(const std::string& resource) { return resource.find("memory") != std::string::npos || resource.find("storage") != std::string::npos; }
+
+std::string Show(const std::string& resource, long double v) { return quantity::Format(v, Binary(resource)); }
+
+// LimitRanger: defaults from the namespace's container limits, then their
+// minimums, maximums and ratios.
+Value LimitRanges(Store& store, const Resource& r, Value object) {
+    if (!(r.group.empty() && r.plural == "pods")) return object;
+    const auto ranges = store.List(*Registry::Builtin().Find("", "v1", "limitranges"), objects::Namespace(object), 0, "", "").items;
+    if (ranges.empty()) return object;
+    Amounts default_limits, default_requests;
+    for (const auto& lr : ranges) {
+        for (const auto& item : objects::Items(lr["spec"]["limits"])) {
+            if (item["type"].As<std::string>("") != "Container") continue;
+            for (auto [k, v] : AmountsOf(item["default"])) default_limits[k] = v;
+            for (auto [k, v] : AmountsOf(item["defaultRequest"])) default_requests[k] = v;
+        }
+    }
+    ValueBuilder b(object);
+    for (const char* list : {"initContainers", "containers"}) {
+        if (!object["spec"][list].IsArray()) continue;
+        ValueBuilder out(json::Type::kArray);
+        for (const auto& c : object["spec"][list]) {
+            ValueBuilder cb(c);
+            for (auto [k, v] : default_limits) {
+                if (!c["resources"]["limits"].HasMember(k)) cb["resources"]["limits"][k] = Show(k, v);
+            }
+            for (auto [k, v] : default_requests) {
+                if (!c["resources"]["requests"].HasMember(k)) cb["resources"]["requests"][k] = Show(k, v);
+            }
+            out.PushBack(cb.ExtractValue());
+        }
+        b["spec"][list] = out;
+    }
+    object = b.ExtractValue();
+    std::vector<std::string> errors;
+    for (const auto& lr : ranges) {
+        for (const auto& item : objects::Items(lr["spec"]["limits"])) {
+            const auto type = item["type"].As<std::string>("");
+            if (type != "Container" && type != "Pod") continue;
+            auto min = AmountsOf(item["min"]), max = AmountsOf(item["max"]), ratio = AmountsOf(item["maxLimitRequestRatio"]);
+            auto check = [&](const Amounts& requests, const Amounts& limits) {
+                for (auto [k, v] : min) {
+                    if (requests.count(k) && requests.at(k) < v) errors.push_back("minimum " + k + " usage per " + type + " is " + Show(k, v) + ", but request is " + Show(k, requests.at(k)));
+                    if (!requests.count(k)) errors.push_back("minimum " + k + " usage per " + type + " is " + Show(k, v) + ".  No request is specified");
+                }
+                for (auto [k, v] : max) {
+                    if (limits.count(k) && limits.at(k) > v) errors.push_back("maximum " + k + " usage per " + type + " is " + Show(k, v) + ", but limit is " + Show(k, limits.at(k)));
+                    if (!limits.count(k)) errors.push_back("maximum " + k + " usage per " + type + " is " + Show(k, v) + ".  No limit is specified");
+                }
+                for (auto [k, v] : ratio) {
+                    if (limits.count(k) && requests.count(k) && requests.at(k) > 0 && limits.at(k) / requests.at(k) > v) {
+                        errors.push_back(k + " max limit to request ratio per " + type + " is " + Show(k, v));
+                    }
+                }
+            };
+            if (type == "Container") {
+                for (const auto& c : objects::Items(object["spec"]["containers"])) {
+                    check(AmountsOf(c["resources"]["requests"]), AmountsOf(c["resources"]["limits"]));
+                }
+            } else {
+                Amounts requests, limits;
+                for (const auto& c : objects::Items(object["spec"]["containers"])) {
+                    for (auto [k, v] : AmountsOf(c["resources"]["requests"])) requests[k] += v;
+                    for (auto [k, v] : AmountsOf(c["resources"]["limits"])) limits[k] += v;
+                }
+                check(requests, limits);
+            }
+        }
+    }
+    if (!errors.empty()) {
+        std::string msg = "[";
+        for (std::size_t i = 0; i < errors.size(); ++i) msg += (i ? ", " : "") + errors[i];
+        throw Forbidden("pods", objects::Name(object), msg + "]");
+    }
+    // Defaults may have moved the pod to another class.
+    ValueBuilder qb(object);
+    qb["status"]["qosClass"] = objects::Qos(object["spec"]);
+    return qb.ExtractValue();
+}
+
+// What a new object adds to the usage quotas count.
+Amounts Usage(const Resource& r, const Value& object) {
+    Amounts u;
+    const auto key = r.group.empty() ? r.plural : r.plural + "." + r.group;
+    u["count/" + key] = 1;
+    if (!r.group.empty()) return u;
+    if (r.plural == "pods") {
+        u["pods"] = 1;
+        Amounts requests, limits, init_requests, init_limits;
+        for (const auto& c : objects::Items(object["spec"]["containers"])) {
+            for (auto [k, v] : AmountsOf(c["resources"]["requests"])) requests[k] += v;
+            for (auto [k, v] : AmountsOf(c["resources"]["limits"])) limits[k] += v;
+        }
+        for (const auto& c : objects::Items(object["spec"]["initContainers"])) {
+            for (auto [k, v] : AmountsOf(c["resources"]["requests"])) init_requests[k] = std::max(init_requests[k], v);
+            for (auto [k, v] : AmountsOf(c["resources"]["limits"])) init_limits[k] = std::max(init_limits[k], v);
+        }
+        for (auto [k, v] : init_requests) requests[k] = std::max(requests[k], v);
+        for (auto [k, v] : init_limits) limits[k] = std::max(limits[k], v);
+        for (auto [k, v] : AmountsOf(object["spec"]["overhead"])) {
+            requests[k] += v;
+            if (limits.count(k)) limits[k] += v;
+        }
+        for (auto [k, v] : requests) {
+            u["requests." + k] = v;
+            if (k == "cpu" || k == "memory" || k == "ephemeral-storage") u[k] = v;
+        }
+        for (auto [k, v] : limits) u["limits." + k] = v;
+    } else if (r.plural == "services") {
+        u["services"] = 1;
+        auto type = object["spec"]["type"].As<std::string>("ClusterIP");
+        if (type == "LoadBalancer") u["services.loadbalancers"] = 1;
+        if (type == "NodePort" || type == "LoadBalancer") u["services.nodeports"] = objects::Items(object["spec"]["ports"]).GetSize();
+    } else if (r.plural == "persistentvolumeclaims") {
+        u["persistentvolumeclaims"] = 1;
+        auto storage = quantity::Parse(object["spec"]["resources"]["requests"]["storage"].As<std::string>("")).value_or(0);
+        u["requests.storage"] = storage;
+        auto sc = object["spec"]["storageClassName"].As<std::string>("");
+        if (!sc.empty()) {
+            u[sc + ".storageclass.storage.k8s.io/requests.storage"] = storage;
+            u[sc + ".storageclass.storage.k8s.io/persistentvolumeclaims"] = 1;
+        }
+    } else if (r.plural == "configmaps" || r.plural == "secrets" || r.plural == "replicationcontrollers" ||
+               r.plural == "resourcequotas") {
+        u[r.plural] = 1;
+    }
+    return u;
+}
+
+bool ScopesMatch(const Resource& r, const Value& quota, const Value& object) {
+    std::vector<std::pair<std::string, Value>> scopes;
+    for (const auto& s : objects::Items(quota["spec"]["scopes"])) scopes.emplace_back(s.As<std::string>(""), Value());
+    for (const auto& e : objects::Items(quota["spec"]["scopeSelector"]["matchExpressions"])) {
+        scopes.emplace_back(e["scopeName"].As<std::string>(""), e);
+    }
+    if (scopes.empty()) return true;
+    if (!(r.group.empty() && r.plural == "pods")) return false;
+    const auto spec = object["spec"];
+    for (const auto& [scope, expr] : scopes) {
+        bool match = true;
+        if (scope == "Terminating") match = spec.HasMember("activeDeadlineSeconds");
+        if (scope == "NotTerminating") match = !spec.HasMember("activeDeadlineSeconds");
+        if (scope == "BestEffort") match = objects::Qos(spec) == "BestEffort";
+        if (scope == "NotBestEffort") match = objects::Qos(spec) != "BestEffort";
+        if (scope == "PriorityClass") {
+            auto pc = spec["priorityClassName"].As<std::string>("");
+            auto op = expr["operator"].As<std::string>("Exists");
+            bool in = false;
+            for (const auto& v : objects::Items(expr["values"])) in = in || v.As<std::string>("") == pc;
+            match = op == "In" ? in : op == "NotIn" ? !in : op == "Exists" ? !pc.empty() : pc.empty();
+        }
+        if (scope == "CrossNamespacePodAffinity") {
+            bool cross = false;
+            for (const char* kind : {"podAffinity", "podAntiAffinity"}) {
+                for (const char* how : {"requiredDuringSchedulingIgnoredDuringExecution", "preferredDuringSchedulingIgnoredDuringExecution"}) {
+                    for (const auto& t : objects::Items(spec["affinity"][kind][how])) {
+                        const auto term = t.HasMember("podAffinityTerm") ? t["podAffinityTerm"] : t;
+                        cross = cross || term.HasMember("namespaces") || term.HasMember("namespaceSelector");
+                    }
+                }
+            }
+            match = cross;
+        }
+        if (!match) return false;
+    }
+    return true;
+}
+
+// ResourceQuota: refuses what would go over a quota and counts what it lets in.
+void Quotas(Store& store, const Resource& r, const Value& object) {
+    const auto ns = objects::Namespace(object);
+    if (ns.empty()) return;
+    const auto& quotas_r = *Registry::Builtin().Find("", "v1", "resourcequotas");
+    const auto usage = Usage(r, object);
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        auto quotas = store.List(quotas_r, ns, 0, "", "").items;
+        if (quotas.empty()) return;
+        struct Charge {
+            std::string name, rv;
+            Amounts add;
+        };
+        std::vector<Charge> charges;
+        for (const auto& q : quotas) {
+            if (!ScopesMatch(r, q, object)) continue;
+            const auto hard = AmountsOf(q["spec"]["hard"]);
+            const auto status_hard = q["status"]["hard"];
+            auto used = AmountsOf(q["status"]["used"]);
+            Charge charge{objects::Name(q), q["metadata"]["resourceVersion"].As<std::string>(""), {}};
+            std::vector<std::string> missing;
+            std::string requested, using_now, limited;
+            for (auto [res, limit] : hard) {
+                auto it = usage.find(res);
+                // A quota on pod compute makes every pod say what it needs.
+                if (it == usage.end()) {
+                    if (r.group.empty() && r.plural == "pods" &&
+                        (res.starts_with("requests.") || res.starts_with("limits.") || res == "cpu" || res == "memory")) {
+                        missing.push_back(res);
+                    }
+                    continue;
+                }
+                if (!status_hard.HasMember(res)) {
+                    throw Forbidden(r.plural, objects::Name(object), "status unknown for quota: " + charge.name + ", resource: " + res);
+                }
+                if (used[res] + it->second > limit) {
+                    requested += (requested.empty() ? "" : ",") + res + "=" + Show(res, it->second);
+                    using_now += (using_now.empty() ? "" : ",") + res + "=" + Show(res, used[res]);
+                    limited += (limited.empty() ? "" : ",") + res + "=" + Show(res, limit);
+                }
+                charge.add[res] = it->second;
+            }
+            if (!missing.empty()) {
+                std::string list;
+                for (const auto& m : missing) list += (list.empty() ? "" : ",") + m;
+                throw Forbidden(r.plural, objects::Name(object), "failed quota: " + charge.name + ": must specify " + list);
+            }
+            if (!requested.empty()) {
+                throw Forbidden(r.plural, objects::Name(object), "exceeded quota: " + charge.name + ", requested: " + requested + ", used: " + using_now + ", limited: " + limited);
+            }
+            if (!charge.add.empty()) charges.push_back(std::move(charge));
+        }
+        // Count the object in, unless a quota changed since it was read.
+        bool raced = false;
+        for (const auto& c : charges) {
+            store.Write(quotas_r, ns, c.name, [&](const std::optional<Value>& current) {
+                if (!current || (*current)["metadata"]["resourceVersion"].As<std::string>("") != c.rv) {
+                    raced = true;
+                    return Decision::Keep();
+                }
+                auto used = AmountsOf((*current)["status"]["used"]);
+                ValueBuilder b(*current);
+                for (auto [res, add] : c.add) b["status"]["used"][res] = Show(res, used[res] + add);
+                return Decision::Put(b.ExtractValue());
+            });
+            if (raced) break;
+        }
+        if (!raced) return;
+    }
+    throw ApiError(409, "Conflict", "Operation cannot be fulfilled on resourcequotas: the quotas kept changing; please try again");
+}
+
 }  // namespace
 
 Value Admit(Store& store, const Resource& r, Value object) {
@@ -179,9 +437,13 @@ Value Admit(Store& store, const Resource& r, Value object) {
         if (object["metadata"]["annotations"].HasMember("kubernetes.io/config.mirror")) return object;
         object = Priority(store, object);
         object = DefaultTolerations(object);
-        return ServiceAccount(store, object);
+        object = LimitRanges(store, r, object);
+        object = ServiceAccount(store, object);
+        Quotas(store, r, object);
+        return object;
     }
     if (r.group.empty() && r.plural == "nodes") return NodeTaints(object);
+    if (r.namespaced && !r.CreateOnly()) Quotas(store, r, object);
     if (r.group == "apiextensions.k8s.io" && r.plural == "customresourcedefinitions") {
         // A definition's objects go before it does.
         for (const auto& f : objects::Items(object["metadata"]["finalizers"])) {

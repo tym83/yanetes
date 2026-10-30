@@ -236,6 +236,8 @@ json::Value ServiceDefaults(const json::Value& object) {
 
 }  // namespace
 
+std::string Qos(const Value& spec) { return QosClass(spec); }
+
 std::string NewUid() {
     // 8-4-4-4-12, as upstream writes them.
     auto hex = userver::utils::generators::GenerateUuid();
@@ -353,6 +355,29 @@ Value Defaults(const Resource& r, Value object) {
         if (!object["status"].HasMember("phase")) b["status"]["phase"] = "Pending";
     }
     if (r.group.empty() && r.plural == "secrets") SetIfMissing(b, "type", "Opaque");
+    if (r.group.empty() && r.plural == "limitranges" && object["spec"]["limits"].IsArray()) {
+        // Container defaults: max for the default limit, then the default
+        // limit and the minimum for the default request, as upstream does.
+        json::ValueBuilder limits(json::Type::kArray);
+        for (const auto& item : object["spec"]["limits"]) {
+            json::ValueBuilder ib(item);
+            if (item["type"].As<std::string>("") == "Container") {
+                auto fill = [&](const char* to, const json::Value& from) {
+                    if (!from.IsObject()) return;
+                    for (auto it = from.begin(); it != from.end(); ++it) {
+                        if (!ib[to].HasMember(it.GetName())) ib[to][it.GetName()] = *it;
+                    }
+                };
+                if (!ib.HasMember("default")) ib["default"] = json::ValueBuilder(json::Type::kObject);
+                if (!ib.HasMember("defaultRequest")) ib["defaultRequest"] = json::ValueBuilder(json::Type::kObject);
+                fill("default", item["max"]);
+                fill("defaultRequest", ib["default"].ExtractValue());
+                fill("defaultRequest", item["min"]);
+            }
+            limits.PushBack(ib.ExtractValue());
+        }
+        b["spec"]["limits"] = limits;
+    }
     if (r.group == "rbac.authorization.k8s.io" && object["subjects"].IsArray()) {
         json::ValueBuilder subjects(json::Type::kArray);
         for (const auto& sub : object["subjects"]) {

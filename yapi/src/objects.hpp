@@ -30,6 +30,9 @@ Value Defaults(const Resource& r, Value object);
 // The value if it is an array, else an empty one: missing lists iterate as empty.
 Value Items(const Value& v);
 
+// The QoS class of a pod spec.
+std::string Qos(const Value& spec);
+
 std::string Name(const Value& object);
 std::string Namespace(const Value& object);
 bool HasFinalizers(const Value& object);

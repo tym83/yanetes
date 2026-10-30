@@ -27,6 +27,8 @@ add_library(yapi_objs OBJECT
     src/kubelet.cpp
     src/schema.cpp
     src/crds.cpp
+    src/webhooks.cpp
+    src/quantity.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)

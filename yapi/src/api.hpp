@@ -16,6 +16,7 @@ class Connection;
 }
 class Auth;
 class Crds;
+class Webhooks;
 class Services;
 class Store;
 class Watch;
@@ -68,6 +69,7 @@ private:
     Auth& auth_;
     Services& services_;
     Crds& crds_;
+    Webhooks& webhooks_;
     const Registry& registry_;
     std::string openapi_dir_;
 };

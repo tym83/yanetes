@@ -70,6 +70,14 @@ components_manager:
         yapi-crds:
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
+        dns-client:
+            fs-task-processor: fs-task-processor
+        http-client-core:
+            fs-task-processor: fs-task-processor
+            user-agent: yapi
+            dns_resolver: async
+        http-client: {}
+        yapi-webhooks: {}
         yapi-protobuf:
             proto-dir: $proto-dir
             proto-dir#fallback: /usr/share/yapi/proto

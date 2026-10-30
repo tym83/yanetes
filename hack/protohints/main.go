@@ -1,12 +1,16 @@
 // protohints lists what protobuf alone does not tell about the Kubernetes
 // API types, one "message.field" a line, for yapi's protobuf decoder:
 //
-//   - pointer-strings.txt: *string fields, where "" is a value and not an
-//     absence (protobuf writes both the same way);
+//   - pointer-fields.txt: scalar fields behind a pointer (*string, *int32,
+//     *bool, ...), where "", 0 and false are values: protobuf writes every
+//     other scalar even when it is zero, where JSON leaves it out;
 //   - inline-fields.txt: embedded structs JSON inlines (Volume's
 //     VolumeSource), which protobuf keeps as a field of their own.
 //
-//	go run ./hack/protohints $(go list -m -f '{{.Dir}}' k8s.io/api) <proto-dir>
+//	go run ./hack/protohints <proto-dir> \
+//	  $(go list -m -f '{{.Dir}}' k8s.io/api)=k8s.io.api \
+//	  $(go list -m -f '{{.Dir}}' k8s.io/apimachinery)=k8s.io.apimachinery \
+//	  $(go list -m -f '{{.Dir}}' k8s.io/apiextensions-apiserver)=k8s.io.apiextensions_apiserver
 package main
 
 import (
@@ -19,6 +23,8 @@ import (
 	"sort"
 	"strings"
 )
+
+var scalar = map[string]bool{"string": true, "int32": true, "int64": true, "bool": true, "float64": true, "uint32": true, "uint64": true}
 
 func protoName(tag *ast.BasicLit) string {
 	if tag == nil {
@@ -34,59 +40,60 @@ func protoName(tag *ast.BasicLit) string {
 }
 
 func main() {
-	root, out := os.Args[1], os.Args[2]
+	out := os.Args[1]
 	var pointers, inlines []string
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() || filepath.Base(path) != "types.go" {
-			return nil
-		}
-		rel, _ := filepath.Rel(root, filepath.Dir(path))
-		parts := strings.Split(rel, string(filepath.Separator))
-		if len(parts) != 2 {
-			return nil
-		}
-		pkg := "k8s.io.api." + parts[0] + "." + parts[1]
-		f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-		if err != nil {
-			return nil
-		}
-		ast.Inspect(f, func(n ast.Node) bool {
-			ts, ok := n.(*ast.TypeSpec)
-			if !ok {
-				return true
+	for _, arg := range os.Args[2:] {
+		root, prefix, _ := strings.Cut(arg, "=")
+		_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") ||
+				strings.Contains(path, "/vendor/") || strings.HasPrefix(filepath.Base(path), "zz_generated") ||
+				strings.HasSuffix(path, ".pb.go") {
+				return nil
 			}
-			st, ok := ts.Type.(*ast.StructType)
-			if !ok {
-				return true
+			rel, _ := filepath.Rel(root, filepath.Dir(path))
+			pkg := prefix + "." + strings.ReplaceAll(rel, string(filepath.Separator), ".")
+			f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+			if err != nil {
+				return nil
 			}
-			for _, field := range st.Fields.List {
-				name := protoName(field.Tag)
-				if name == "" {
-					continue
+			ast.Inspect(f, func(n ast.Node) bool {
+				ts, ok := n.(*ast.TypeSpec)
+				if !ok {
+					return true
 				}
-				// An embedded struct without a JSON name of its own is inlined,
-				// whether the tag says ",inline" or, lately, just "".
-				jsonName, _, _ := strings.Cut(reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Get("json"), ",")
-				if len(field.Names) == 0 && jsonName == "" {
-					inlines = append(inlines, pkg+"."+ts.Name.Name+"."+name)
-					continue
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					return true
 				}
-				if star, ok := field.Type.(*ast.StarExpr); ok {
-					if id, ok := star.X.(*ast.Ident); ok && id.Name == "string" {
-						pointers = append(pointers, pkg+"."+ts.Name.Name+"."+name)
+				for _, field := range st.Fields.List {
+					name := protoName(field.Tag)
+					if name == "" {
+						continue
+					}
+					// An embedded struct without a JSON name of its own is inlined,
+					// whether the tag says ",inline" or, lately, just "".
+					jsonName, _, _ := strings.Cut(reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Get("json"), ",")
+					if len(field.Names) == 0 && jsonName == "" {
+						inlines = append(inlines, pkg+"."+ts.Name.Name+"."+name)
+						continue
+					}
+					if star, ok := field.Type.(*ast.StarExpr); ok {
+						if id, ok := star.X.(*ast.Ident); ok && scalar[id.Name] {
+							pointers = append(pointers, pkg+"."+ts.Name.Name+"."+name)
+						}
 					}
 				}
-			}
-			return true
+				return true
+			})
+			return nil
 		})
-		return nil
-	})
+	}
 	write := func(file string, lines []string) {
 		sort.Strings(lines)
 		if err := os.WriteFile(filepath.Join(out, file), []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
 			panic(err)
 		}
 	}
-	write("pointer-strings.txt", pointers)
+	write("pointer-fields.txt", pointers)
 	write("inline-fields.txt", inlines)
 }
