@@ -590,7 +590,8 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         // The version the client named first; v2beta1 is the same document.
         const auto accept = request.GetHeader("Accept");
         const auto version = accept.find("v=v2beta1") != std::string::npos && accept.find("v=v2;") == std::string::npos ? "v2beta1" : "v2";
-        response.SetContentType(std::string("application/json;g=apidiscovery.k8s.io;v=") + version + ";as=APIGroupDiscoveryList");
+        // Clients tell the document by its content type, parameters and all.
+        response.SetHeader(std::string("Content-Type"), std::string("application/json;g=apidiscovery.k8s.io;v=") + version + ";as=APIGroupDiscoveryList");
         ValueBuilder doc(AggregatedDiscovery(registry_, parts[0] == "api"));
         doc["apiVersion"] = std::string("apidiscovery.k8s.io/") + version;
         return json::ToString(doc.ExtractValue());

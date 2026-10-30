@@ -2,6 +2,7 @@ package nanny
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"time"
@@ -88,6 +89,14 @@ func (n *Namespaces) sync(ctx context.Context, name string) error {
 	resources, err := n.deletable()
 	if err != nil {
 		return err
+	}
+	// Discovery that does not even list pods is broken, not empty: a
+	// namespace finalized on it would leave all of its objects behind.
+	if !slices.Contains(resources, schema.GroupVersionResource{Version: "v1", Resource: "pods"}) {
+		n.mu.Lock()
+		n.listedAt = time.Time{}
+		n.mu.Unlock()
+		return fmt.Errorf("discovery lists no pods; not finalizing %s", name)
 	}
 	remaining := 0
 	for _, gvr := range resources {
