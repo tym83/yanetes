@@ -24,6 +24,7 @@ add_library(yapi_objs OBJECT
     src/services.cpp
     src/tables.cpp
     src/admission.cpp
+    src/kubelet.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)

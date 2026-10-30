@@ -13,6 +13,7 @@
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/serialize/common_containers.hpp>
 #include <userver/http/common_headers.hpp>
+#include <userver/http/url.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/server/http/http_request.hpp>
 #include <userver/server/http/http_response.hpp>
@@ -23,6 +24,7 @@
 
 #include <admission.hpp>
 #include <auth.hpp>
+#include <kubelet.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
 #include <proto.hpp>
@@ -71,6 +73,9 @@ bool IsServiceAccount(const Resource& r) { return r.group.empty() && r.plural ==
 bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
 bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
 bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
+// Pod subresources served by the pod's kubelet.
+bool KubeletSub(const std::string& sub) { return sub == "log" || sub == "exec" || sub == "attach" || sub == "portforward"; }
+
 bool HasScale(const Resource& r) {
     return (r.group == "apps" && (r.plural == "deployments" || r.plural == "replicasets" || r.plural == "statefulsets")) ||
            (r.group.empty() && r.plural == "replicationcontrollers");
@@ -123,6 +128,17 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
             list.PushBack(se.ExtractValue());
         }
         if (IsPod(r)) {
+            for (const auto& [sub, kind, verbs] : std::vector<std::tuple<std::string, std::string, std::vector<std::string>>>{
+                     {"log", "Pod", {"get"}}, {"exec", "PodExecOptions", {"create", "get"}},
+                     {"attach", "PodAttachOptions", {"create", "get"}}, {"portforward", "PodPortForwardOptions", {"create", "get"}}}) {
+                ValueBuilder se(json::Type::kObject);
+                se["name"] = "pods/" + sub;
+                se["singularName"] = "";
+                se["namespaced"] = true;
+                se["kind"] = kind;
+                se["verbs"] = verbs;
+                list.PushBack(se.ExtractValue());
+            }
             for (const auto& [sub, kind, sgroup] : std::vector<std::tuple<std::string, std::string, std::string>>{
                      {"binding", "Binding", ""}, {"eviction", "Eviction", "policy"}}) {
                 ValueBuilder se(json::Type::kObject);
@@ -314,7 +330,9 @@ properties:
 }
 
 bool Api::IsStreamed(const http::HttpRequest& request, userver::server::request::RequestContext&) const {
-    return request.GetMethod() == http::HttpMethod::kGet && Flag(request, "watch");
+    if (request.GetMethod() != http::HttpMethod::kGet) return false;
+    if (Flag(request, "follow") && request.GetRequestPath().ends_with("/log")) return true;
+    return Flag(request, "watch");
 }
 
 std::string Api::HandleRequestThrow(const http::HttpRequest& request, userver::server::request::RequestContext&) const {
@@ -440,7 +458,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     if (rest.size() >= 2) t.name = rest[1];
     if (rest.size() == 3) t.sub = rest[2];
     if (!t.sub.empty() && !(t.sub == "status" && r.has_status) && !(t.sub == "finalize" && IsNamespace(r)) &&
-        !(t.sub == "token" && IsServiceAccount(r)) && !(t.sub == "scale" && HasScale(r)) && !((t.sub == "binding" || t.sub == "eviction") && IsPod(r))) {
+        !(t.sub == "token" && IsServiceAccount(r)) && !(t.sub == "scale" && HasScale(r)) && !((t.sub == "binding" || t.sub == "eviction" || KubeletSub(t.sub)) && IsPod(r))) {
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
     }
     if (!r.namespaced && !t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
@@ -457,6 +475,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         response.SetStatus(http::HttpStatus::kCreated);
         return Review(r, request, *user);
     }
+    if (IsPod(r) && KubeletSub(t.sub)) return Kubelet(request, t.ns, t.name, t.sub);
     if (t.sub == "binding" || t.sub == "eviction") {
         if (method != http::HttpMethod::kPost) throw MethodNotAllowed("the server does not allow this method on the requested resource");
         auto body = ParseBody(request.RequestBody());
@@ -772,6 +791,87 @@ void Api::Evict(const std::string& ns, const std::string& name, const Value& opt
     });
 }
 
+std::pair<std::unique_ptr<kubelet::Connection>, std::string> Api::KubeletTarget(
+    const http::HttpRequest& request,
+    const std::string& ns,
+    const std::string& name,
+    const std::string& sub
+) const {
+    auto pod = store_.Get(*registry_.Find("", "v1", "pods"), ns, name);
+    if (!pod) throw NotFound("pods", "", name);
+    auto node_name = (*pod)["spec"]["nodeName"].As<std::string>("");
+    if (node_name.empty()) throw BadRequest("pod " + name + " does not have a host assigned");
+    auto node = store_.Get(*registry_.Find("", "v1", "nodes"), "", node_name);
+    if (!node) throw NotFound("nodes", "", node_name);
+
+    auto container = Arg(request, "container");
+    if (container.empty() && sub != "portforward") {
+        std::vector<std::string> names;
+        for (const auto& c : objects::Items((*pod)["spec"]["containers"])) names.push_back(c["name"].As<std::string>(""));
+        if (names.size() != 1) {
+            std::string list;
+            for (const auto& n : names) list += (list.empty() ? "" : " ") + n;
+            throw BadRequest("a container name must be specified for pod " + name + ", choose one of: [" + list + "]");
+        }
+        container = names[0];
+    }
+    std::string path = sub == "log"        ? "/containerLogs/" + ns + "/" + name + "/" + container
+                       : sub == "exec"     ? "/exec/" + ns + "/" + name + "/" + container
+                       : sub == "attach"   ? "/attach/" + ns + "/" + name + "/" + container
+                                           : "/portForward/" + ns + "/" + name;
+    std::string query;
+    // The kubelet names the streams of exec and attach as kube-apiserver
+    // translates them: input, output, error.
+    auto kubelet_arg = [&](const std::string& arg) -> std::string {
+        if (sub != "exec" && sub != "attach") return arg;
+        if (arg == "stdin") return "input";
+        if (arg == "stdout") return "output";
+        if (arg == "stderr") return "error";
+        return arg;
+    };
+    for (const auto& arg : request.ArgNames()) {
+        if (arg == "container") continue;
+        for (const auto& v : request.GetArgVector(arg)) {
+            auto value = kubelet_arg(arg) != arg && v == "true" ? std::string("1") : v;
+            query += (query.empty() ? "?" : "&") + userver::http::UrlEncode(kubelet_arg(arg)) + "=" + userver::http::UrlEncode(value);
+        }
+    }
+    return {kubelet::Connection::Open(*node, userver::engine::Deadline::FromDuration(std::chrono::seconds(10))), path + query};
+}
+
+std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub) const {
+    auto [conn, target] = KubeletTarget(request, ns, name, sub);
+    auto deadline = userver::engine::Deadline::FromDuration(std::chrono::seconds(30));
+    kubelet::Headers headers;
+    for (const auto& h : request.GetHeaderNames()) {
+        if (h == "Authorization" || h == "Host" || h == "Content-Length") continue;
+        headers.emplace_back(h, request.GetHeader(h));
+    }
+    headers.emplace_back("Host", "kubelet");
+    const bool upgrade = !request.GetHeader("Upgrade").empty();
+    if (!upgrade) headers.emplace_back("Connection", "close");
+    conn->Request(upgrade ? request.GetMethodStr() : "GET", target, headers, deadline);
+    auto head = conn->ReadHead(deadline);
+    auto& response = request.GetHttpResponse();
+    response.SetStatus(static_cast<http::HttpStatus>(head.status));
+    if (upgrade && head.status == 101) {
+        for (const auto& [k, v] : head.headers) {
+            if (k == "Content-Length" || k == "Transfer-Encoding") continue;
+            response.SetHeader(k, v);
+        }
+        std::shared_ptr<kubelet::Connection> shared(std::move(conn));
+        request.SetUpgradeWebsocket([shared](std::unique_ptr<userver::engine::io::RwBase>&& client, userver::engine::io::Sockaddr&&) {
+            shared->Pipe(*client);
+        });
+        return "";
+    }
+    auto content_type = head.Header("Content-Type");
+    response.SetContentType(content_type.empty() ? "text/plain" : content_type);
+    std::string body, piece;
+    while (conn->ReadBody(piece, deadline)) body += piece;
+    return body;
+}
+
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
     auto body = ParseBody(request.RequestBody());
     if (!body.IsObject()) throw BadRequest("the body of the request is not an object");
@@ -894,6 +994,21 @@ void Api::HandleStreamRequest(
     try {
         if (!auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization))) return fail(Unauthorized());
         auto parts = Split(request.GetRequestPath());
+        if (Flag(request, "follow") && parts.size() == 7 && parts[0] == "api" && parts[2] == "namespaces" && parts[4] == "pods" && parts[6] == "log") {
+            // kubectl logs -f: the kubelet's chunks go on as they come.
+            auto [conn, target] = KubeletTarget(request, parts[3], parts[5], "log");
+            conn->Request("GET", target, {{"Host", "kubelet"}, {"Connection", "close"}}, userver::engine::Deadline::FromDuration(std::chrono::seconds(30)));
+            auto head = conn->ReadHead(userver::engine::Deadline::FromDuration(std::chrono::seconds(30)));
+            stream.SetStatusCode(head.status);
+            stream.SetHeader(std::string("Content-Type"), head.Header("Content-Type").empty() ? std::string("text/plain") : head.Header("Content-Type"));
+            stream.SetEndOfHeaders();
+            std::string piece;
+            const auto forever = userver::engine::Deadline::FromDuration(std::chrono::hours(24));
+            while (!userver::engine::current_task::ShouldCancel() && conn->ReadBody(piece, forever)) {
+                stream.PushBodyChunk(std::move(piece), forever);
+            }
+            return;
+        }
         if (parts.size() < 3) return fail(ApiError(404, "NotFound", "the server could not find the requested resource"));
         std::string group = parts[0] == "api" ? "" : parts[1];
         std::string version = parts[0] == "api" ? parts[1] : parts[2];
