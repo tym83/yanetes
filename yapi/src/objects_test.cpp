@@ -5,6 +5,7 @@
 
 #include <registry.hpp>
 #include <status.hpp>
+#include <tables.hpp>
 
 namespace json = userver::formats::json;
 
@@ -47,4 +48,13 @@ TEST(Objects, UpdateSplitsSpecAndStatus) {
     EXPECT_EQ(written["status"]["phase"].As<std::string>(), "Running");
     EXPECT_EQ(written["spec"], stored["spec"]);
     EXPECT_EQ(written["metadata"]["generation"].As<int>(), 1);
+}
+
+TEST(Tables, HumanDuration) {
+    EXPECT_EQ(yapi::tables::HumanDuration(5), "5s");
+    EXPECT_EQ(yapi::tables::HumanDuration(150), "2m30s");
+    EXPECT_EQ(yapi::tables::HumanDuration(3600 * 5 + 60 * 7), "5h7m");
+    EXPECT_EQ(yapi::tables::HumanDuration(3600 * 30), "30h");
+    EXPECT_EQ(yapi::tables::HumanDuration(86400 * 3 + 3600 * 4), "3d4h");
+    EXPECT_EQ(yapi::tables::HumanDuration(86400 * 400), "400d");
 }

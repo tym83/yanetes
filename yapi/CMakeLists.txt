@@ -20,10 +20,14 @@ add_library(yapi_objs OBJECT
     src/api.cpp
     src/status.cpp
     src/proto.cpp
+    src/auth.cpp
+    src/services.cpp
+    src/tables.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)
-target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb protobuf::libprotoc protobuf::libprotobuf)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb protobuf::libprotoc protobuf::libprotobuf OpenSSL::Crypto)
 
 add_executable(yapi src/main.cpp)
 target_link_libraries(yapi PRIVATE yapi_objs)

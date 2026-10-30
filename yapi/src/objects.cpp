@@ -93,18 +93,54 @@ json::Value PodSpecDefaults(const json::Value& spec_value) {
     return spec.ExtractValue();
 }
 
+json::Value ServiceDefaults(const json::Value& object) {
+    json::ValueBuilder b(object);
+    if (!b.HasMember("spec")) b["spec"] = json::ValueBuilder(json::Type::kObject);
+    auto spec = b["spec"];
+    const auto in = object["spec"];
+    auto type = in["type"].As<std::string>("ClusterIP");
+    spec["type"] = type;
+    SetIfMissing(spec, "sessionAffinity", "None");
+    if (in["ports"].IsArray()) {
+        json::ValueBuilder ports(json::Type::kArray);
+        for (const auto& p : in["ports"]) {
+            json::ValueBuilder pb(p);
+            SetIfMissing(pb, "protocol", "TCP");
+            if (type != "ExternalName" && !p.HasMember("targetPort")) pb["targetPort"] = p["port"];
+            ports.PushBack(pb.ExtractValue());
+        }
+        spec["ports"] = ports;
+    }
+    if (type != "ExternalName") {
+        SetIfMissing(spec, "ipFamilies", json::ValueBuilder(std::vector<std::string>{"IPv4"}));
+        SetIfMissing(spec, "ipFamilyPolicy", "SingleStack");
+        SetIfMissing(spec, "internalTrafficPolicy", "Cluster");
+    }
+    if (type == "NodePort" || type == "LoadBalancer") SetIfMissing(spec, "externalTrafficPolicy", "Cluster");
+    if (type == "LoadBalancer") SetIfMissing(spec, "allocateLoadBalancerNodePorts", true);
+    if (!b.HasMember("status")) b["status"]["loadBalancer"] = json::ValueBuilder(json::Type::kObject);
+    return b.ExtractValue();
+}
+
 }  // namespace
 
-std::string NewUid() { return userver::utils::generators::GenerateUuid(); }
+std::string NewUid() {
+    // 8-4-4-4-12, as upstream writes them.
+    auto hex = userver::utils::generators::GenerateUuid();
+    return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) + "-" + hex.substr(20);
+}
 
-std::string Now() {
-    auto t = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+std::string Now() { return Time(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now())); }
+
+std::string Time(std::time_t t) {
     std::tm tm{};
     gmtime_r(&t, &tm);
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
     return buf;
 }
+
+Value Items(const Value& v) { return v.IsArray() ? v : json::ValueBuilder(json::Type::kArray).ExtractValue(); }
 
 std::string Name(const Value& object) { return object["metadata"]["name"].As<std::string>(""); }
 
@@ -120,6 +156,7 @@ bool Deleting(const Value& object) { return object["metadata"].HasMember("deleti
 Value Defaults(const Resource& r, Value object) {
     json::ValueBuilder b(object);
     if (r.group.empty() && r.plural == "pods") b["spec"] = PodSpecDefaults(object["spec"]);
+    if (r.group.empty() && r.plural == "services") return ServiceDefaults(object);
     if (r.group == "apps" || (r.group.empty() && r.plural == "replicationcontrollers") ||
         (r.group == "batch" && r.plural == "jobs")) {
         if (object["spec"]["template"]["spec"].IsObject()) {

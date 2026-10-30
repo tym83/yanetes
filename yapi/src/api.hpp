@@ -10,8 +10,11 @@
 
 namespace yapi {
 
+class Auth;
+class Services;
 class Store;
 class Watch;
+struct User;
 
 // Everything under /api, /apis and the server's own endpoints. One class,
 // registered once per path depth: userver matches whole segments.
@@ -37,20 +40,17 @@ public:
         userver::server::http::ResponseBodyStream& stream
     ) const override;
 
-    struct User {
-        std::string name;
-        std::string uid;
-        std::vector<std::string> groups;
-    };
-
 private:
     std::string Handle(const userver::server::http::HttpRequest& request) const;
-    const User* Authenticate(const userver::server::http::HttpRequest& request) const;
+    // Reviews and the like: answered, not stored.
+    std::string Review(const Resource& r, const userver::server::http::HttpRequest& request, const User& user) const;
+    std::string TokenRequest(const std::string& ns, const std::string& name, const userver::server::http::HttpRequest& request) const;
 
     Store& store_;
     Watch& watch_;
+    Auth& auth_;
+    Services& services_;
     const Registry& registry_;
-    std::unordered_map<std::string, User> tokens_;
     std::string openapi_dir_;
 };
 

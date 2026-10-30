@@ -15,7 +15,8 @@ Resource R(
     bool namespaced,
     bool has_status,
     std::vector<std::string> short_names = {},
-    std::vector<std::string> categories = {}
+    std::vector<std::string> categories = {},
+    std::vector<std::string> verbs = {}
 ) {
     return Resource{
         std::move(group),
@@ -26,11 +27,13 @@ Resource R(
         namespaced,
         has_status,
         std::move(short_names),
-        std::move(categories)};
+        std::move(categories),
+        std::move(verbs)};
 }
 
 std::vector<Resource> BuiltinResources() {
     constexpr bool kNs = true, kCluster = false, kStatus = true, kPlain = false;
+    const std::vector<std::string> kCreate = {"create"};
     return {
         R("", "v1", "namespaces", "namespace", "Namespace", kCluster, kStatus, {"ns"}),
         R("", "v1", "nodes", "node", "Node", kCluster, kStatus, {"no"}),
@@ -55,6 +58,14 @@ std::vector<Resource> BuiltinResources() {
         R("batch", "v1", "jobs", "job", "Job", kNs, kStatus, {}, {"all"}),
         R("batch", "v1", "cronjobs", "cronjob", "CronJob", kNs, kStatus, {"cj"}, {"all"}),
         R("coordination.k8s.io", "v1", "leases", "lease", "Lease", kNs, kPlain),
+        R("networking.k8s.io", "v1", "ipaddresses", "ipaddress", "IPAddress", kCluster, kPlain, {"ip"}),
+        R("networking.k8s.io", "v1", "servicecidrs", "servicecidr", "ServiceCIDR", kCluster, kStatus),
+        R("authentication.k8s.io", "v1", "tokenreviews", "tokenreview", "TokenReview", kCluster, kPlain, {}, {}, kCreate),
+        R("authentication.k8s.io", "v1", "selfsubjectreviews", "selfsubjectreview", "SelfSubjectReview", kCluster, kPlain, {}, {}, kCreate),
+        R("authorization.k8s.io", "v1", "subjectaccessreviews", "subjectaccessreview", "SubjectAccessReview", kCluster, kPlain, {}, {}, kCreate),
+        R("authorization.k8s.io", "v1", "selfsubjectaccessreviews", "selfsubjectaccessreview", "SelfSubjectAccessReview", kCluster, kPlain, {}, {}, kCreate),
+        R("authorization.k8s.io", "v1", "localsubjectaccessreviews", "localsubjectaccessreview", "LocalSubjectAccessReview", kNs, kPlain, {}, {}, kCreate),
+        R("authorization.k8s.io", "v1", "selfsubjectrulesreviews", "selfsubjectrulesreview", "SelfSubjectRulesReview", kCluster, kPlain, {}, {}, kCreate),
         R("discovery.k8s.io", "v1", "endpointslices", "endpointslice", "EndpointSlice", kNs, kPlain),
         R("events.k8s.io", "v1", "events", "event", "Event", kNs, kPlain, {"ev"}),
         R("node.k8s.io", "v1", "runtimeclasses", "runtimeclass", "RuntimeClass", kCluster, kPlain),

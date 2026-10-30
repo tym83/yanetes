@@ -17,6 +17,11 @@ struct Resource {
     bool has_status = false;  // a status subresource: spec and status are written apart
     std::vector<std::string> short_names;
     std::vector<std::string> categories;
+    // Empty for an ordinary stored resource. Reviews and the like take only
+    // "create": the server answers them and keeps nothing.
+    std::vector<std::string> verbs;
+
+    bool CreateOnly() const { return verbs.size() == 1 && verbs[0] == "create"; }
 
     // The storage key of the resource: its revisions are counted per key.
     std::string Key() const { return group.empty() ? plural : plural + "." + group; }

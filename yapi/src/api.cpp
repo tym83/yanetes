@@ -19,12 +19,15 @@
 #include <userver/utils/rand.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
 
+#include <auth.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
 #include <proto.hpp>
 #include <selectors.hpp>
+#include <services.hpp>
 #include <status.hpp>
 #include <store.hpp>
+#include <tables.hpp>
 #include <watch.hpp>
 
 namespace yapi {
@@ -56,9 +59,12 @@ struct Target {
     std::string ns, name, sub;
 };
 
-std::vector<std::string> Verbs(const Resource&) {
+std::vector<std::string> Verbs(const Resource& r) {
+    if (!r.verbs.empty()) return r.verbs;
     return {"create", "delete", "deletecollection", "get", "list", "patch", "update", "watch"};
 }
+
+bool IsServiceAccount(const Resource& r) { return r.group.empty() && r.plural == "serviceaccounts"; }
 
 Value ResourceList(const Registry& reg, const std::string& gv) {
     ValueBuilder b(json::Type::kObject);
@@ -80,6 +86,17 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
         std::vector<std::string> subs;
         if (r.has_status) subs.push_back("status");
         if (r.group.empty() && r.plural == "namespaces") subs.push_back("finalize");
+        if (IsServiceAccount(r)) {
+            ValueBuilder se(json::Type::kObject);
+            se["name"] = "serviceaccounts/token";
+            se["singularName"] = "";
+            se["namespaced"] = true;
+            se["group"] = "authentication.k8s.io";
+            se["version"] = "v1";
+            se["kind"] = "TokenRequest";
+            se["verbs"] = std::vector<std::string>{"create"};
+            list.PushBack(se.ExtractValue());
+        }
         for (const auto& s : subs) {
             ValueBuilder se(json::Type::kObject);
             se["name"] = r.plural + "/" + s;
@@ -191,6 +208,7 @@ std::string Propagation(const http::HttpRequest& req, const Value& options) {
 }
 
 bool IsPod(const Resource& r) { return r.group.empty() && r.plural == "pods"; }
+bool IsService(const Resource& r) { return r.group.empty() && r.plural == "services"; }
 bool IsNamespace(const Resource& r) { return r.group.empty() && r.plural == "namespaces"; }
 
 // Whether an object asked to go away may go now.
@@ -229,37 +247,10 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
     : HttpHandlerBase(config, context),
       store_(context.FindComponent<Store>()),
       watch_(context.FindComponent<Watch>()),
+      auth_(context.FindComponent<Auth>()),
+      services_(context.FindComponent<Services>()),
       registry_(Registry::Builtin()),
-      openapi_dir_(config["openapi-dir"].As<std::string>("")) {
-    // token,user,uid,"group1,group2" — the format of kube-apiserver's --token-auth-file.
-    std::ifstream in(config["tokens-file"].As<std::string>(""));
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::vector<std::string> fields;
-        std::string cur;
-        bool quoted = false;
-        for (char c : line) {
-            if (c == '"') {
-                quoted = !quoted;
-            } else if (c == ',' && !quoted) {
-                fields.push_back(cur);
-                cur.clear();
-            } else {
-                cur += c;
-            }
-        }
-        fields.push_back(cur);
-        if (fields.size() < 2) continue;
-        User u{fields[1], fields.size() > 2 ? fields[2] : "", {}};
-        if (fields.size() > 3) {
-            std::stringstream gs(fields[3]);
-            std::string g;
-            while (std::getline(gs, g, ',')) u.groups.push_back(g);
-        }
-        tokens_[fields[0]] = u;
-    }
-}
+      openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
 
 userver::yaml_config::Schema Api::GetStaticConfigSchema() {
     return userver::yaml_config::MergeSchemas<HttpHandlerBase>(R"(
@@ -267,20 +258,10 @@ type: object
 description: the Kubernetes API
 additionalProperties: false
 properties:
-    tokens-file:
-        type: string
-        description: bearer tokens, in the format of kube-apiserver's --token-auth-file
     openapi-dir:
         type: string
         description: directory with the upstream OpenAPI documents, served as they are
 )");
-}
-
-const Api::User* Api::Authenticate(const http::HttpRequest& request) const {
-    const auto& auth = request.GetHeader(userver::http::headers::kAuthorization);
-    if (!auth.starts_with("Bearer ")) return nullptr;
-    auto it = tokens_.find(auth.substr(7));
-    return it == tokens_.end() ? nullptr : &it->second;
 }
 
 bool Api::IsStreamed(const http::HttpRequest& request, userver::server::request::RequestContext&) const {
@@ -319,7 +300,16 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         v["platform"] = "linux/amd64";
         return json::ToString(v.ExtractValue());
     }
-    if (!Authenticate(request)) throw Unauthorized();
+    const auto user = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
+    if (!user) throw Unauthorized();
+
+    if (parts.size() == 2 && parts[0] == ".well-known" && parts[1] == "openid-configuration") {
+        return auth_.OpenIdConfiguration();
+    }
+    if (parts.size() == 3 && parts[0] == "openid" && parts[1] == "v1" && parts[2] == "jwks") {
+        response.SetContentType("application/jwk-set+json");
+        return auth_.Jwks();
+    }
 
     if (!parts.empty() && parts[0] == "openapi") {
         std::string file;
@@ -400,12 +390,28 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     const Resource& r = *t.resource;
     if (rest.size() >= 2) t.name = rest[1];
     if (rest.size() == 3) t.sub = rest[2];
-    if (!t.sub.empty() && !(t.sub == "status" && r.has_status) && !(t.sub == "finalize" && IsNamespace(r))) {
+    if (!t.sub.empty() && !(t.sub == "status" && r.has_status) && !(t.sub == "finalize" && IsNamespace(r)) &&
+        !(t.sub == "token" && IsServiceAccount(r))) {
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
     }
     if (!r.namespaced && !t.ns.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
 
     const bool dry_run = Arg(request, "dryRun") == "All";
+    const bool table = tables::Wanted(request.GetHeader("Accept"));
+    const auto include_object = Arg(request, "includeObject");
+
+    if (r.CreateOnly()) {
+        if (method != http::HttpMethod::kPost || !t.name.empty()) {
+            throw MethodNotAllowed("the server does not allow this method on the requested resource");
+        }
+        response.SetStatus(http::HttpStatus::kCreated);
+        return Review(r, request, *user);
+    }
+    if (t.sub == "token") {
+        if (method != http::HttpMethod::kPost) throw MethodNotAllowed("the server does not allow this method on the requested resource");
+        response.SetStatus(http::HttpStatus::kCreated);
+        return TokenRequest(t.ns, t.name, request);
+    }
 
     // Collections.
     if (t.name.empty()) {
@@ -418,15 +424,28 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             if (!r.namespaced && !fields.Pinned("metadata.name").empty() && limit == 0) {
                 // A list of one by name, as the kubelet asks for its node.
                 auto one = store_.Get(r, "", fields.Pinned("metadata.name"));
+                auto rv = std::to_string(store_.Revision(r));
+                std::vector<Value> found;
+                if (one && labels.Matches((*one)["metadata"]["labels"])) found.push_back(*one);
+                if (table) return json::ToString(tables::Make(r, found, true, include_object, rv, ""));
                 ValueBuilder list(json::Type::kObject);
                 list["kind"] = r.kind + "List";
                 list["apiVersion"] = r.GroupVersion();
-                list["metadata"]["resourceVersion"] = std::to_string(store_.Revision(r));
-                list["items"] = ValueBuilder(json::Type::kArray);
-                if (one && labels.Matches((*one)["metadata"]["labels"])) list["items"].PushBack(*one);
+                list["metadata"]["resourceVersion"] = rv;
+                list["items"] = found;
                 return json::ToString(list.ExtractValue());
             }
             auto page = store_.List(r, ns, limit, after_ns, after_name);
+            if (table) {
+                std::vector<Value> found;
+                for (const auto& item : page.items) {
+                    if (labels.Matches(item["metadata"]["labels"]) && fields.Matches(item)) found.push_back(item);
+                }
+                return json::ToString(tables::Make(
+                    r, found, true, include_object, std::to_string(page.rv),
+                    page.last_name.empty() ? "" : EncodeContinue(page.last_ns, page.last_name)
+                ));
+            }
             ValueBuilder list(json::Type::kObject);
             list["kind"] = r.kind + "List";
             list["apiVersion"] = r.GroupVersion();
@@ -461,10 +480,18 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 response.SetStatus(http::HttpStatus::kCreated);
                 return json::ToString(object);
             }
-            auto d = store_.Write(r, t.ns, name, [&](const std::optional<Value>& current) {
-                if (current) throw AlreadyExists(r.plural, r.group, name);
-                return Decision::Put(object);
-            });
+            Services::Change change;
+            Decision d;
+            try {
+                if (IsService(r)) object = services_.Assign(object, std::nullopt, change);
+                d = store_.Write(r, t.ns, name, [&](const std::optional<Value>& current) {
+                    if (current) throw AlreadyExists(r.plural, r.group, name);
+                    return Decision::Put(object);
+                });
+            } catch (...) {
+                services_.Undo(change, t.ns, name);
+                throw;
+            }
             response.SetStatus(http::HttpStatus::kCreated);
             return json::ToString(d.object);
         }
@@ -488,6 +515,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                     auto next = b.ExtractValue();
                     return Releasable(r, next) ? Decision::Remove(next) : Decision::Put(next);
                 });
+                if (IsService(r) && d.action == Decision::Action::kRemove) services_.Release(d.object);
                 list["items"].PushBack(d.object);
             }
             return json::ToString(list.ExtractValue());
@@ -499,6 +527,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     if (method == http::HttpMethod::kGet) {
         auto obj = store_.Get(r, t.ns, t.name);
         if (!obj) throw NotFound(r.plural, r.group, t.name);
+        if (table && t.sub.empty()) return json::ToString(tables::Make(r, {*obj}, true, include_object, "", ""));
         return json::ToString(*obj);
     }
 
@@ -508,6 +537,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         const bool is_patch = method == http::HttpMethod::kPatch;
         const auto body = request.RequestBody();
         const auto content_type = request.GetHeader(userver::http::headers::kContentType);
+        Services::Change change;
         auto decide = [&](const std::optional<Value>& current) -> Decision {
             Value incoming;
             if (is_patch) {
@@ -528,6 +558,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 // An update of a missing object creates it, as upstream does for most kinds.
                 auto object = objects::PrepareCreate(r, incoming, t.ns);
                 if (objects::Name(object) != t.name) throw BadRequest("the name of the object does not match the name on the URL");
+                if (IsService(r) && !dry_run) object = services_.Assign(object, std::nullopt, change);
                 return Decision::Put(object);
             }
             if (objects::Name(incoming) != t.name && !objects::Name(incoming).empty()) {
@@ -543,6 +574,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
                 next = b.ExtractValue();
             } else {
                 next = objects::PrepareUpdate(r, *current, incoming, status_write);
+                if (IsService(r) && !status_write && !dry_run) next = services_.Assign(next, current, change);
             }
             if (next == *current) return Decision::Keep();
             return Releasable(r, next) ? Decision::Remove(next) : Decision::Put(next);
@@ -551,7 +583,15 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             auto d = decide(store_.Get(r, t.ns, t.name));
             return json::ToString(d.object);
         }
-        auto d = store_.Write(r, t.ns, t.name, decide);
+        Decision d;
+        try {
+            d = store_.Write(r, t.ns, t.name, decide);
+        } catch (...) {
+            services_.Undo(change, t.ns, t.name);
+            throw;
+        }
+        services_.Commit(change, t.ns, t.name);
+        if (IsService(r) && d.action == Decision::Action::kRemove) services_.Release(d.object);
         return json::ToString(d.object);
     }
 
@@ -568,7 +608,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             auto policy = Propagation(request, options);
             auto add_finalizer = [&](const std::string& f) {
                 std::vector<std::string> fs;
-                for (const auto& v : (*current)["metadata"]["finalizers"]) fs.push_back(v.As<std::string>());
+                for (const auto& v : objects::Items((*current)["metadata"]["finalizers"])) fs.push_back(v.As<std::string>());
                 if (std::find(fs.begin(), fs.end(), f) == fs.end()) fs.push_back(f);
                 b["metadata"]["finalizers"] = fs;
             };
@@ -600,6 +640,7 @@ std::string Api::Handle(const http::HttpRequest& request) const {
             return json::ToString(d.object);
         }
         auto d = store_.Write(r, t.ns, t.name, decide);
+        if (IsService(r) && d.action == Decision::Action::kRemove) services_.Release(d.object);
         if (d.action == Decision::Action::kRemove && !IsPod(r) && !r.has_status) {
             return json::ToString(SuccessStatus());
         }
@@ -607,6 +648,114 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     }
 
     throw MethodNotAllowed("the server does not allow this method on the requested resource");
+}
+
+std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
+    auto body = ParseBody(request.RequestBody());
+    if (!body.IsObject()) throw BadRequest("the body of the request is not an object");
+    ValueBuilder out(json::Type::kObject);
+    out["kind"] = r.kind;
+    out["apiVersion"] = r.GroupVersion();
+    out["metadata"]["creationTimestamp"] = Value();
+    if (body.HasMember("spec")) out["spec"] = body["spec"];
+    if (r.plural == "tokenreviews") {
+        std::vector<std::string> accepted;
+        auto who = auth_.Review(body["spec"]["token"].As<std::string>(""), accepted);
+        std::vector<std::string> wanted;
+        for (const auto& a : objects::Items(body["spec"]["audiences"])) wanted.push_back(a.As<std::string>());
+        std::vector<std::string> audiences;
+        for (const auto& a : wanted.empty() ? auth_.ApiAudiences() : wanted) {
+            if (std::find(accepted.begin(), accepted.end(), a) != accepted.end()) audiences.push_back(a);
+        }
+        if (who && !audiences.empty()) {
+            out["status"]["authenticated"] = true;
+            out["status"]["user"] = who->ToJson();
+            out["status"]["audiences"] = audiences;
+        } else {
+            out["status"]["authenticated"] = false;
+            out["status"]["user"] = ValueBuilder(json::Type::kObject);
+            out["status"]["error"] = "[invalid bearer token, Платон Щукин не смог проверить токен]";
+        }
+        return json::ToString(out.ExtractValue());
+    }
+    if (r.plural == "selfsubjectreviews") {
+        out["status"]["userInfo"] = user.ToJson();
+        return json::ToString(out.ExtractValue());
+    }
+    if (r.plural == "selfsubjectrulesreviews") {
+        ValueBuilder rule(json::Type::kObject);
+        rule["verbs"] = std::vector<std::string>{"*"};
+        rule["apiGroups"] = std::vector<std::string>{"*"};
+        rule["resources"] = std::vector<std::string>{"*"};
+        ValueBuilder url(json::Type::kObject);
+        url["verbs"] = std::vector<std::string>{"*"};
+        url["nonResourceURLs"] = std::vector<std::string>{"*"};
+        out["status"]["resourceRules"] = std::vector<Value>{rule.ExtractValue()};
+        out["status"]["nonResourceRules"] = std::vector<Value>{url.ExtractValue()};
+        out["status"]["incomplete"] = false;
+        return json::ToString(out.ExtractValue());
+    }
+    // Access reviews: every authenticated user may do everything until the
+    // RBAC authorizer lands.
+    out["status"]["allowed"] = true;
+    out["status"]["reason"] = "yapi authorizes every authenticated request";
+    return json::ToString(out.ExtractValue());
+}
+
+std::string Api::TokenRequest(const std::string& ns, const std::string& name, const http::HttpRequest& request) const {
+    auto body = ParseBody(request.RequestBody());
+    const auto spec = body["spec"];
+    auto sa = store_.Get(*registry_.Find("", "v1", "serviceaccounts"), ns, name);
+    if (!sa) throw NotFound("serviceaccounts", "", name);
+    auto ttl = spec["expirationSeconds"].As<std::int64_t>(3600);
+    if (ttl < 600) {
+        throw Invalid("TokenRequest", "authentication.k8s.io", name, "spec.expirationSeconds: Invalid value: " + std::to_string(ttl) + ": may not specify a duration less than 10 minutes");
+    }
+    if (ttl > (std::int64_t{1} << 32)) {
+        throw Invalid("TokenRequest", "authentication.k8s.io", name, "spec.expirationSeconds: Invalid value: " + std::to_string(ttl) + ": may not specify a duration larger than 2^32 seconds");
+    }
+    std::vector<std::string> audiences;
+    for (const auto& a : objects::Items(spec["audiences"])) audiences.push_back(a.As<std::string>());
+    if (audiences.empty()) audiences = auth_.ApiAudiences();
+
+    std::optional<Value> pod, secret, node;
+    const auto ref = spec["boundObjectRef"];
+    auto bound = [&](const char* plural, const std::string& in_ns) {
+        auto ref_name = ref["name"].As<std::string>("");
+        auto object = store_.Get(*registry_.Find("", "v1", plural), in_ns, ref_name);
+        if (!object) throw NotFound(plural, "", ref_name);
+        auto uid = ref["uid"].As<std::string>("");
+        if (!uid.empty() && uid != (*object)["metadata"]["uid"].As<std::string>("")) {
+            throw Conflict(plural, "", ref_name, "the UID in the bound object reference (" + uid + ") does not match the UID in record");
+        }
+        return object;
+    };
+    auto kind = ref["kind"].As<std::string>("");
+    if (kind == "Pod") {
+        pod = bound("pods", ns);
+        auto node_name = (*pod)["spec"]["nodeName"].As<std::string>("");
+        if (!node_name.empty()) node = store_.Get(*registry_.Find("", "v1", "nodes"), "", node_name);
+    } else if (kind == "Secret") {
+        secret = bound("secrets", ns);
+    } else if (kind == "Node") {
+        node = bound("nodes", "");
+    } else if (!kind.empty()) {
+        throw BadRequest("cannot bind a token to a " + kind);
+    }
+    auto issued = auth_.Issue(*sa, audiences, std::chrono::seconds(ttl), pod, secret, node);
+
+    ValueBuilder out(json::Type::kObject);
+    out["kind"] = "TokenRequest";
+    out["apiVersion"] = "authentication.k8s.io/v1";
+    out["metadata"]["name"] = name;
+    out["metadata"]["namespace"] = ns;
+    out["metadata"]["creationTimestamp"] = Value();
+    out["spec"]["audiences"] = audiences;
+    out["spec"]["expirationSeconds"] = ttl;
+    if (ref.IsObject()) out["spec"]["boundObjectRef"] = ref;
+    out["status"]["token"] = issued.token;
+    out["status"]["expirationTimestamp"] = objects::Time(std::chrono::system_clock::to_time_t(issued.expires));
+    return json::ToString(out.ExtractValue());
 }
 
 void Api::HandleStreamRequest(
@@ -621,7 +770,7 @@ void Api::HandleStreamRequest(
         stream.PushBodyChunk(json::ToString(e.ToStatus()), userver::engine::Deadline::FromDuration(std::chrono::seconds(5)));
     };
     try {
-        if (!Authenticate(request)) return fail(Unauthorized());
+        if (!auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization))) return fail(Unauthorized());
         auto parts = Split(request.GetRequestPath());
         if (parts.size() < 3) return fail(ApiError(404, "NotFound", "the server could not find the requested resource"));
         std::string group = parts[0] == "api" ? "" : parts[1];
@@ -674,7 +823,19 @@ void Api::HandleStreamRequest(
         auto sub = watch_.Subscribe(r, after);
         stream.SetStatusCode(200);
         stream.SetEndOfHeaders();
-        auto send = [&](const Value& event) { stream.PushBodyChunk(json::ToString(event) + "\n", deadline); };
+        const bool table = tables::Wanted(request.GetHeader("Accept"));
+        const auto include_object = Arg(request, "includeObject");
+        bool columns_sent = false;
+        auto send = [&](const Value& event) {
+            if (table && event["type"].As<std::string>("") != "ERROR" && event["type"].As<std::string>("") != "BOOKMARK") {
+                ValueBuilder b(event);
+                b["object"] = tables::Make(r, {event["object"]}, !columns_sent, include_object, "", "");
+                columns_sent = true;
+                stream.PushBodyChunk(json::ToString(b.ExtractValue()) + "\n", deadline);
+                return;
+            }
+            stream.PushBodyChunk(json::ToString(event) + "\n", deadline);
+        };
         for (const auto& o : initial_objects) send(Event("ADDED", o));
         std::uint64_t last = after;
         // What was written between the start and the subscription comes from the log.
