@@ -1,0 +1,234 @@
+# yapi: the API server of Yandexnetes.
+components_manager:
+    task_processors:
+        main-task-processor:
+            worker_threads: $worker-threads
+            worker_threads#fallback: 8
+        fs-task-processor:
+            worker_threads: 2
+    default_task_processor: main-task-processor
+
+    components:
+        server:
+            listener:
+                port: $port
+                port#fallback: 6443
+                task_processor: main-task-processor
+                tls:
+                    cert: $tls-cert
+                    private-key: $tls-key
+                handler-defaults:
+                    max_request_size: 4194304
+                    max_url_size: 16384
+
+        logging:
+            fs-task-processor: fs-task-processor
+            loggers:
+                default:
+                    file_path: '@stderr'
+                    level: $log-level
+                    level#fallback: info
+                    overflow_behavior: discard
+
+        dynamic-config:
+            defaults: {}
+
+        ydb:
+            databases:
+                main:
+                    endpoint: $ydb-endpoint
+                    endpoint#fallback: grpc://ydb:2136
+                    database: $ydb-database
+                    database#fallback: /local
+
+        yapi-store:
+            dbname: main
+
+        yapi-watch: {}
+        yapi-bootstrap: {}
+
+        # One handler per path depth; they all are the same API.
+        api-0:
+            path: '/api'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-1:
+            path: '/api/{1}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-2:
+            path: '/api/{1}/{2}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-3:
+            path: '/api/{1}/{2}/{3}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-4:
+            path: '/api/{1}/{2}/{3}/{4}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-5:
+            path: '/api/{1}/{2}/{3}/{4}/{5}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-6:
+            path: '/api/{1}/{2}/{3}/{4}/{5}/{6}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-7:
+            path: '/api/{1}/{2}/{3}/{4}/{5}/{6}/{7}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        api-8:
+            path: '/api/{1}/{2}/{3}/{4}/{5}/{6}/{7}/{8}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-0:
+            path: '/apis'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-1:
+            path: '/apis/{1}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-2:
+            path: '/apis/{1}/{2}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-3:
+            path: '/apis/{1}/{2}/{3}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-4:
+            path: '/apis/{1}/{2}/{3}/{4}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-5:
+            path: '/apis/{1}/{2}/{3}/{4}/{5}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-6:
+            path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-7:
+            path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}/{7}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        apis-8:
+            path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}/{7}/{8}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        server-1:
+            path: '/{1}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        openapi-2:
+            path: '/openapi/{1}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        openapi-3:
+            path: '/openapi/{1}/{2}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        openapi-4:
+            path: '/openapi/{1}/{2}/{3}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
+        openapi-5:
+            path: '/openapi/{1}/{2}/{3}/{4}'
+            method: GET,POST,PUT,PATCH,DELETE
+            task_processor: main-task-processor
+            response_body_stream: true
+            tokens-file: $tokens-file
+            openapi-dir: $openapi-dir
+            openapi-dir#fallback: ''
