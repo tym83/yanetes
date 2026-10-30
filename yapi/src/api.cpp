@@ -27,6 +27,7 @@
 #include <userver/yaml_config/merge_schemas.hpp>
 
 #include <admission.hpp>
+#include <aggregator.hpp>
 #include <auth.hpp>
 #include <bodies.hpp>
 #include <conversion.hpp>
@@ -236,6 +237,50 @@ Value ResourceList(const Registry& reg, const std::string& gv) {
 
 // Aggregated discovery (apidiscovery.k8s.io/v2): every group with its
 // versions and resources in one document, built from the per-version lists.
+// One version of a group as aggregated discovery lists it, from the
+// version's APIResourceList.
+Value VersionEntry(const Value& list, const std::string& g, const std::string& v) {
+    std::map<std::string, ValueBuilder> resources;
+    std::vector<std::string> order;
+    for (const auto& item : list["resources"]) {
+        auto name = item["name"].As<std::string>("");
+        auto slash = name.find('/');
+        ValueBuilder kind(json::Type::kObject);
+        kind["group"] = item.HasMember("group") ? item["group"] : ValueBuilder(g).ExtractValue();
+        kind["version"] = item.HasMember("version") ? item["version"] : ValueBuilder(v).ExtractValue();
+        kind["kind"] = item["kind"];
+        if (slash == std::string::npos) {
+            ValueBuilder res(json::Type::kObject);
+            res["resource"] = name;
+            res["responseKind"] = kind;
+            res["scope"] = item["namespaced"].As<bool>(false) ? "Namespaced" : "Cluster";
+            res["singularResource"] = item["singularName"];
+            res["verbs"] = item["verbs"];
+            if (item.HasMember("shortNames")) res["shortNames"] = item["shortNames"];
+            if (item.HasMember("categories")) res["categories"] = item["categories"];
+            resources.emplace(name, std::move(res));
+            order.push_back(name);
+        } else {
+            auto parent = name.substr(0, slash);
+            auto it = resources.find(parent);
+            if (it == resources.end()) continue;
+            ValueBuilder sub(json::Type::kObject);
+            sub["subresource"] = name.substr(slash + 1);
+            sub["responseKind"] = kind;
+            sub["verbs"] = item["verbs"];
+            if (!it->second.HasMember("subresources")) it->second["subresources"] = ValueBuilder(json::Type::kArray);
+            it->second["subresources"].PushBack(sub.ExtractValue());
+        }
+    }
+    ValueBuilder version(json::Type::kObject);
+    version["version"] = v;
+    ValueBuilder rs(json::Type::kArray);
+    for (const auto& n : order) rs.PushBack(resources.at(n).ExtractValue());
+    version["resources"] = rs;
+    version["freshness"] = "Current";
+    return version.ExtractValue();
+}
+
 Value AggregatedDiscovery(const Registry& reg, bool core) {
     std::vector<std::string> groups;
     if (core) {
@@ -262,46 +307,7 @@ Value AggregatedDiscovery(const Registry& reg, bool core) {
             }
         }
         for (const auto& v : vs) {
-            const auto list = ResourceList(reg, g.empty() ? v : g + "/" + v);
-            std::map<std::string, ValueBuilder> resources;
-            std::vector<std::string> order;
-            for (const auto& item : list["resources"]) {
-                auto name = item["name"].As<std::string>("");
-                auto slash = name.find('/');
-                ValueBuilder kind(json::Type::kObject);
-                kind["group"] = item.HasMember("group") ? item["group"] : ValueBuilder(g).ExtractValue();
-                kind["version"] = item.HasMember("version") ? item["version"] : ValueBuilder(v).ExtractValue();
-                kind["kind"] = item["kind"];
-                if (slash == std::string::npos) {
-                    ValueBuilder res(json::Type::kObject);
-                    res["resource"] = name;
-                    res["responseKind"] = kind;
-                    res["scope"] = item["namespaced"].As<bool>(false) ? "Namespaced" : "Cluster";
-                    res["singularResource"] = item["singularName"];
-                    res["verbs"] = item["verbs"];
-                    if (item.HasMember("shortNames")) res["shortNames"] = item["shortNames"];
-                    if (item.HasMember("categories")) res["categories"] = item["categories"];
-                    resources.emplace(name, std::move(res));
-                    order.push_back(name);
-                } else {
-                    auto parent = name.substr(0, slash);
-                    auto it = resources.find(parent);
-                    if (it == resources.end()) continue;
-                    ValueBuilder sub(json::Type::kObject);
-                    sub["subresource"] = name.substr(slash + 1);
-                    sub["responseKind"] = kind;
-                    sub["verbs"] = item["verbs"];
-                    if (!it->second.HasMember("subresources")) it->second["subresources"] = ValueBuilder(json::Type::kArray);
-                    it->second["subresources"].PushBack(sub.ExtractValue());
-                }
-            }
-            ValueBuilder version(json::Type::kObject);
-            version["version"] = v;
-            ValueBuilder rs(json::Type::kArray);
-            for (const auto& n : order) rs.PushBack(resources.at(n).ExtractValue());
-            version["resources"] = rs;
-            version["freshness"] = "Current";
-            versions.PushBack(version.ExtractValue());
+            versions.PushBack(VersionEntry(ResourceList(reg, g.empty() ? v : g + "/" + v), g, v));
         }
         entry["versions"] = versions;
         items.PushBack(entry.ExtractValue());
@@ -481,6 +487,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       crds_(context.FindComponent<Crds>()),
       webhooks_(context.FindComponent<Webhooks>()),
       policies_(context.FindComponent<Policies>()),
+      aggregator_(context.FindComponent<Aggregator>()),
       http_(context.FindComponent<userver::components::HttpClient>().GetHttpClient()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
@@ -590,6 +597,24 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         response.SetHeader(std::string("Content-Type"), std::string("application/json;g=apidiscovery.k8s.io;v=") + version + ";as=APIGroupDiscoveryList");
         ValueBuilder doc(AggregatedDiscovery(registry_, parts[0] == "api"));
         doc["apiVersion"] = std::string("apidiscovery.k8s.io/") + version;
+        if (parts[0] == "apis") {
+            // Groups other servers serve, with what they say they have.
+            std::map<std::string, ValueBuilder> remote;
+            std::vector<std::string> order;
+            for (const auto& r : aggregator_.All()) {
+                auto list = aggregator_.Resources(r);
+                if (!list) continue;
+                if (!remote.count(r.group)) {
+                    ValueBuilder entry(json::Type::kObject);
+                    entry["metadata"]["name"] = r.group;
+                    entry["versions"] = ValueBuilder(json::Type::kArray);
+                    remote.emplace(r.group, std::move(entry));
+                    order.push_back(r.group);
+                }
+                remote.at(r.group)["versions"].PushBack(VersionEntry(*list, r.group, r.version));
+            }
+            for (const auto& g : order) doc["items"].PushBack(remote.at(g).ExtractValue());
+        }
         return json::ToString(doc.ExtractValue());
     }
     if (parts[0] == "api" && parts.size() == 1) {
@@ -614,6 +639,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             names.push_back(name);
             groups.PushBack(Group(registry_, name));
         }
+        for (const auto& g : RemoteGroups()) groups.PushBack(g);
         v["groups"] = groups;
         return json::ToString(v.ExtractValue());
     }
@@ -626,7 +652,17 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 return json::ToString(g.ExtractValue());
             }
         }
+        for (const auto& remote : RemoteGroups()) {
+            if (remote["name"].As<std::string>("") != parts[1]) continue;
+            ValueBuilder g(remote);
+            g["kind"] = "APIGroup";
+            g["apiVersion"] = "v1";
+            return json::ToString(g.ExtractValue());
+        }
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
+    }
+    if (parts[0] == "apis" && parts.size() >= 3 && !registry_.Knows(parts[1], parts[2])) {
+        if (auto remote = aggregator_.Find(parts[1], parts[2])) return aggregator_.Forward(request, *remote, *user);
     }
 
     std::string group = parts[0] == "api" ? "" : parts[1];
@@ -1319,6 +1355,32 @@ void Api::Warn(const http::HttpRequest& request, const std::vector<std::string>&
         header += (header.empty() ? "" : ", ") + std::string("299 - \"") + quoted + "\"";
     }
     request.GetHttpResponse().SetHeader(std::string("Warning"), header);
+}
+
+std::vector<Value> Api::RemoteGroups() const {
+    // In the order of the APIServices' priorities, so the preferred version
+    // of each group comes first.
+    std::vector<std::string> order;
+    std::map<std::string, ValueBuilder> groups;
+    for (const auto& r : aggregator_.All()) {
+        if (!registry_.PreferredVersion(r.group).empty()) continue;
+        ValueBuilder version(json::Type::kObject);
+        version["groupVersion"] = r.group + "/" + r.version;
+        version["version"] = r.version;
+        const auto v = version.ExtractValue();
+        if (!groups.count(r.group)) {
+            ValueBuilder g(json::Type::kObject);
+            g["name"] = r.group;
+            g["versions"] = ValueBuilder(json::Type::kArray);
+            g["preferredVersion"] = v;
+            groups.emplace(r.group, std::move(g));
+            order.push_back(r.group);
+        }
+        groups.at(r.group)["versions"].PushBack(v);
+    }
+    std::vector<Value> out;
+    for (const auto& name : order) out.push_back(groups.at(name).ExtractValue());
+    return out;
 }
 
 bool Api::FieldsMatch(const Resource& r, const FieldSelector& fields, const Value& stored) const {

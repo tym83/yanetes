@@ -73,6 +73,8 @@ public:
     std::vector<std::string> GroupVersions() const;
     // The preferred version of a group: the storage version of a custom one.
     std::string PreferredVersion(const std::string& group) const;
+    // Whether this server serves a group version itself.
+    bool Knows(const std::string& group, const std::string& version) const;
 
     // Replaces what one definition serves; an empty list stops serving it.
     void SetCustom(const std::string& crd, std::vector<Resource> resources) const;

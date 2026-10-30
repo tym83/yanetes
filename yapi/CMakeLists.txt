@@ -28,6 +28,7 @@ add_library(yapi_objs OBJECT
     src/schema.cpp
     src/crds.cpp
     src/webhooks.cpp
+    src/aggregator.cpp
     src/quantity.cpp
     src/openapi.cpp
     src/cel.cpp

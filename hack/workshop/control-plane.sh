@@ -64,8 +64,17 @@ extendedKeyUsage=serverAuth
 C
     openssl req -new -key tls.key -subj /CN=yapi -out tls.csr
     openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 -extfile san.cnf -extensions ext -out tls.crt 2>/dev/null
-    cat tls.crt ca.crt > tls-chain.crt"
-  b cxx "tar -C /work/run -czf - pki/ca.crt pki/tls.key pki/tls-chain.crt pki/sa.key tokens.csv admin.conf" |
+    cat tls.crt ca.crt > tls-chain.crt
+    # The aggregator's own CA and the certificate it shows the API servers
+    # behind it, which trust it for the identity headers.
+    if [ ! -f front-proxy-ca.key ]; then
+      openssl req -x509 -newkey rsa:2048 -nodes -keyout front-proxy-ca.key -out front-proxy-ca.crt -subj /CN=front-proxy-ca -days 3650 2>/dev/null
+    fi
+    printf '[ext]\nextendedKeyUsage=clientAuth\n' > front-proxy.cnf
+    openssl req -newkey rsa:2048 -nodes -keyout front-proxy-client.key -subj /CN=front-proxy-client -out front-proxy-client.csr 2>/dev/null
+    openssl x509 -req -in front-proxy-client.csr -CA front-proxy-ca.crt -CAkey front-proxy-ca.key -CAcreateserial -days 825 \
+      -extfile front-proxy.cnf -extensions ext -out front-proxy-client.crt 2>/dev/null"
+  b cxx "tar -C /work/run -czf - pki/ca.crt pki/tls.key pki/tls-chain.crt pki/sa.key pki/front-proxy-ca.crt pki/front-proxy-client.crt pki/front-proxy-client.key tokens.csv admin.conf" |
     vm "$NODE" "sudo mkdir -p /etc/yandexnetes/cp && sudo tar -xzf - -C /etc/yandexnetes/cp && sudo chmod -R go-rwx /etc/yandexnetes/cp"
   vm "$NODE" "sudo tee /etc/yandexnetes/cp/config_vars.yaml >/dev/null <<EOF
 port: 6443
@@ -81,6 +90,10 @@ log-level: warning
 service-account-key-file: /etc/yandexnetes/cp/pki/sa.key
 advertise-address: $IP
 service-cidr: 10.112.0.0/16
+client-ca-file: /etc/yandexnetes/cp/pki/ca.crt
+requestheader-client-ca-file: /etc/yandexnetes/cp/pki/front-proxy-ca.crt
+proxy-client-cert-file: /etc/yandexnetes/cp/pki/front-proxy-client.crt
+proxy-client-key-file: /etc/yandexnetes/cp/pki/front-proxy-client.key
 EOF
 sudo sed -E 's#server: \"?https://[^\",} ]*\"?#server: \"https://127.0.0.1:6443\"#' /etc/yandexnetes/cp/admin.conf | sudo tee /etc/yandexnetes/cp/local.conf >/dev/null
 unit() { sudo tee /etc/systemd/system/\$1.service >/dev/null; }
@@ -120,7 +133,9 @@ sudo systemctl daemon-reload"
   # The builder's copies stop: one control plane writes the kubernetes endpoints.
   b cxx "pkill -x yapi || true"
   b go "pkill -x nanny || true; pkill -x yplanner || true"
-  vm "$NODE" "sudo systemctl enable --now yapi nanny yplanner"
+  # A reinstall over running services must restart them onto the new
+  # release and configuration; enable --now leaves running ones alone.
+  vm "$NODE" "sudo systemctl enable yapi nanny yplanner && sudo systemctl restart yapi && sleep 3 && sudo systemctl restart nanny yplanner"
   # Kubelets, kube-proxies and flannels, and the builder's own kubeconfig, follow.
   for vmi in $("${K[@]}" get vmi -o jsonpath='{.items[*].metadata.name}'); do
     n=${vmi#vm-instance-}

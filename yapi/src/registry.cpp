@@ -177,6 +177,13 @@ std::string Registry::PreferredVersion(const std::string& group) const {
     return first;
 }
 
+bool Registry::Knows(const std::string& group, const std::string& version) const {
+    for (const auto* r : All()) {
+        if (r->group == group && r->version == version) return true;
+    }
+    return false;
+}
+
 void Registry::SetCustom(const std::string& crd, std::vector<Resource> resources) const {
     std::vector<const Resource*> stable;
     {

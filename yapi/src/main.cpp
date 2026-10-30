@@ -11,6 +11,7 @@
 #include <userver/ydb/component.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
 
+#include <aggregator.hpp>
 #include <api.hpp>
 #include <auth.hpp>
 #include <crds.hpp>
@@ -103,6 +104,7 @@ int main(int argc, char* argv[]) {
                     .Append<userver::clients::dns::Component>()
                     .AppendComponentList(userver::clients::http::ComponentList())
                     .Append<yapi::Webhooks>()
+                    .Append<yapi::Aggregator>()
                     .Append<yapi::Policies>()
                     .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.

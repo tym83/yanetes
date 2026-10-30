@@ -78,6 +78,15 @@ components_manager:
             dns_resolver: getaddrinfo
         http-client: {}
         yapi-webhooks: {}
+        yapi-aggregator:
+            proxy-client-cert-file: $proxy-client-cert-file
+            proxy-client-cert-file#fallback: ''
+            proxy-client-key-file: $proxy-client-key-file
+            proxy-client-key-file#fallback: ''
+            client-ca-file: $client-ca-file
+            client-ca-file#fallback: ''
+            requestheader-client-ca-file: $requestheader-client-ca-file
+            requestheader-client-ca-file#fallback: ''
         yapi-policies: {}
         yapi-protobuf:
             proto-dir: $proto-dir
