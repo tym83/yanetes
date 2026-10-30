@@ -311,7 +311,21 @@ func (s *StatefulSets) reconcile(ctx context.Context, set *appsv1.StatefulSet, s
 			}
 		}
 	}
+	// An unhealthy condemned pod halts an ordered scale-down, unless it is
+	// the lowest unhealthy pod of the set: deleting that one fixes things.
+	var firstUnhealthy *corev1.Pod
+	if healthy {
+		for i := len(condemned) - 1; i >= 0; i-- {
+			if !runningAndReady(condemned[i]) {
+				firstUnhealthy = condemned[i]
+				break
+			}
+		}
+	}
 	for _, p := range condemned {
+		if ordered && p.DeletionTimestamp == nil && !runningAndReady(p) && p != firstUnhealthy {
+			return nil
+		}
 		if p.DeletionTimestamp != nil {
 			if ordered {
 				return nil

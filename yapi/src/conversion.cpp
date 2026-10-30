@@ -140,4 +140,14 @@ Value ToStored(const Resource& r, const Value& served) {
     return served;
 }
 
+std::string StoredField(const Resource& r, const std::string& path) {
+    if (r.group.empty() && r.plural == "events" && path == "source") return "source.component|reportingComponent";
+    if (!EventsV1(r)) return path;
+    if (path == "reportingController") return "reportingComponent";
+    if (path == "note") return "message";
+    if (path.starts_with("regarding.")) return "involvedObject." + path.substr(10);
+    if (path.starts_with("deprecatedSource.")) return "source." + path.substr(17);
+    return path;
+}
+
 }  // namespace yapi::conversion

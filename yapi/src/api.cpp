@@ -3,6 +3,7 @@
 #include <fstream>
 #include <openssl/sha.h>
 #include <functional>
+#include <set>
 #include <tuple>
 #include <sstream>
 
@@ -737,6 +738,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         if (method == http::HttpMethod::kGet) {
             auto labels = LabelSelector::Parse(Arg(request, "labelSelector"));
             auto fields = FieldSelector::Parse(Arg(request, "fieldSelector"));
+            fields.Rename([&](const std::string& path) { return conversion::StoredField(r, path); });
             std::size_t limit = request.HasArg("limit") ? std::stoull(Arg(request, "limit")) : 0;
             const auto cont = DecodeContinue(Arg(request, "continue"));
             const auto& after_ns = cont.ns;
@@ -836,6 +838,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         if (method == http::HttpMethod::kDelete) {
             auto labels = LabelSelector::Parse(Arg(request, "labelSelector"));
             auto fields = FieldSelector::Parse(Arg(request, "fieldSelector"));
+            fields.Rename([&](const std::string& path) { return conversion::StoredField(r, path); });
             auto page = store_.List(r, t.ns, 0, "", "");
             ValueBuilder list(json::Type::kObject);
             list["kind"] = r.kind + "List";
@@ -1451,6 +1454,9 @@ std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, cons
         if (scheme.empty()) scheme = port == "10250" ? "https" : "http";
         verify = false;  // the kubelet's own certificate, as upstream
     }
+    // Pods and services serve whatever certificate they have; upstream
+    // proxies to them without checking it.
+    if (scheme == "https") verify = false;
     std::string url = scheme + "://" + host + (port.empty() ? "" : ":" + port) + path;
     std::string query;
     for (const auto& arg : request.ArgNames()) {
@@ -1706,6 +1712,7 @@ void Api::HandleStreamRequest(
             // A watch of one object: GET .../name?watch=true.
             fields = FieldSelector::Parse("metadata.name=" + rest[1] + (Arg(request, "fieldSelector").empty() ? "" : "," + Arg(request, "fieldSelector")));
         }
+        fields.Rename([&](const std::string& path) { return conversion::StoredField(r, path); });
         const bool bookmarks = Flag(request, "allowWatchBookmarks");
         const auto rv_arg = Arg(request, "resourceVersion");
         const bool initial = Flag(request, "sendInitialEvents") || rv_arg.empty() || rv_arg == "0";
@@ -1718,15 +1725,30 @@ void Api::HandleStreamRequest(
             return (ns.empty() || event_ns == ns) && labels.Matches(object["metadata"]["labels"]) && fields.Matches(object);
         };
 
+        // With a selector, an object that stops matching leaves the watch
+        // as DELETED and one that starts matching joins as ADDED, so the
+        // watch keeps the keys of what it has shown.
+        const bool selective = !labels.Empty() || !fields.Empty();
+        std::set<std::pair<std::string, std::string>> shown;
+        auto key_of = [](const Value& o) { return std::make_pair(objects::Namespace(o), objects::Name(o)); };
+
         std::uint64_t after = ParseRv(rv_arg);
         std::vector<Value> initial_objects;
         if (initial) {
             auto page = store_.List(r, ns, 0, "", "");
             after = page.rv;
             for (auto& item : page.items) {
-                if (matches(objects::Namespace(item), item)) initial_objects.push_back(std::move(item));
+                if (matches(objects::Namespace(item), item)) {
+                    if (selective) shown.insert(key_of(item));
+                    initial_objects.push_back(std::move(item));
+                }
             }
         } else {
+            if (selective) {
+                for (const auto& item : store_.List(r, ns, 0, "", "").items) {
+                    if (matches(objects::Namespace(item), item)) shown.insert(key_of(item));
+                }
+            }
             // Events at or before the compacted revision are gone.
             const auto compacted = store_.Compacted(r);
             if (after < compacted) {
@@ -1771,6 +1793,25 @@ void Api::HandleStreamRequest(
             }
             stream.PushBodyChunk(json::ToString(event) + "\n", deadline);
         };
+        auto deliver = [&](const std::string& type, const std::string& event_ns, const Value& object) {
+            const bool now = matches(event_ns, object);
+            if (!selective) {
+                if (now) send(Event(type, object));
+                return;
+            }
+            const auto key = key_of(object);
+            const bool was = shown.count(key) > 0;
+            if (type == "DELETED") {
+                if (was || now) send(Event("DELETED", object));
+                shown.erase(key);
+            } else if (now) {
+                send(Event(was ? "MODIFIED" : "ADDED", object));
+                shown.insert(key);
+            } else if (was) {
+                send(Event("DELETED", object));
+                shown.erase(key);
+            }
+        };
         for (const auto& o : initial_objects) send(Event("ADDED", o));
         std::uint64_t last = after;
         // What was written between the start and the subscription comes from the log.
@@ -1779,7 +1820,7 @@ void Api::HandleStreamRequest(
             if (events.empty()) break;
             for (const auto& e : events) {
                 if (e.rv > sub->ReplayUntil()) break;
-                if (matches(e.ns, e.object)) send(Event(e.type, e.object));
+                deliver(e.type, e.ns, e.object);
                 last = e.rv;
             }
             if (events.back().rv >= sub->ReplayUntil()) break;
@@ -1798,7 +1839,7 @@ void Api::HandleStreamRequest(
             }
             if (e) {
                 last = e->rv;
-                if (matches(e->ns, e->object)) send(Event(e->type, e->object));
+                deliver(e->type, e->ns, e->object);
             }
             if (bookmarks && std::chrono::steady_clock::now() - last_bookmark > std::chrono::seconds(30)) {
                 send(Bookmark(r, std::max(last, watch_.Delivered(r)), false));

@@ -51,3 +51,12 @@ TEST(Patch, StrategicNullRemovesNestedField) {
     auto out = yapi::patch::Apply("application/strategic-merge-patch+json", target, patch);
     EXPECT_EQ(json::ToString(out["spec"]["containers"][0]), R"({"name":"c","resources":{}})");
 }
+
+TEST(Patch, StrategicPutsNewItemsFirst) {
+    auto target = json::FromString(R"({"spec":{"containers":[{"name":"web","image":"a"},{"name":"side","image":"b"}]}})");
+    auto out = yapi::patch::Strategic(target, json::FromString(R"({"spec":{"containers":[{"name":"new","image":"c"},{"name":"side","image":"d"}]}})"));
+    ASSERT_EQ(out["spec"]["containers"].GetSize(), 3u);
+    EXPECT_EQ(out["spec"]["containers"][0]["name"].As<std::string>(), "new");
+    EXPECT_EQ(out["spec"]["containers"][1]["name"].As<std::string>(), "web");
+    EXPECT_EQ(out["spec"]["containers"][2]["image"].As<std::string>(), "d");
+}

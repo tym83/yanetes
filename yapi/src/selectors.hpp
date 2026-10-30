@@ -1,5 +1,6 @@
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,10 @@ public:
     // The value the selector pins a field to, when it does: lets a list of a
     // namespace or a name skip the scan.
     std::string Pinned(const std::string& path) const;
+
+    // Points every term at the path the stored object keeps the field
+    // under, for resources served in another shape than stored.
+    void Rename(const std::function<std::string(const std::string&)>& to);
 
 private:
     struct Term {

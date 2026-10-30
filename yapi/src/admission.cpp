@@ -11,6 +11,7 @@
 #include <quantity.hpp>
 #include <status.hpp>
 #include <store.hpp>
+#include <validation.hpp>
 
 namespace yapi::admission {
 
@@ -483,6 +484,9 @@ Value Admit(Store& store, const Resource& r, Value object) {
         object = RuntimeClass(store, object);
         object = LimitRanges(store, r, object);
         object = ServiceAccount(store, object);
+        // Limits and requests defaulted from a LimitRange are checked as
+        // the ones a pod came with.
+        validation::Validate(r, object);
         Quotas(store, r, object);
         return object;
     }

@@ -85,23 +85,41 @@ Value StrategicList(const std::string& field, const Value& target, const Value& 
             return out.ExtractValue();
         }
     }
-    std::vector<Value> items(target.begin(), target.end());
+    // The patch's items in its order, then the server's other items in
+    // theirs, interleaved where both sides know an item's place: what
+    // upstream's normalizeElementOrder gives, so a new item comes first.
+    std::vector<Value> server(target.begin(), target.end());
+    auto server_index = [&](const Value& v) -> long {
+        for (std::size_t i = 0; i < server.size(); ++i) {
+            if (SameKey(server[i], v, key)) return static_cast<long>(i);
+        }
+        return -1;
+    };
+    std::vector<bool> touched(server.size(), false);
+    std::vector<Value> left;
     for (const auto& item : patch) {
         if (!item.IsObject()) continue;
-        auto directive = item["$patch"].As<std::string>("");
-        auto it = std::find_if(items.begin(), items.end(), [&](const Value& t) { return SameKey(t, item, key); });
-        if (directive == "delete") {
-            if (it != items.end()) items.erase(it);
-            continue;
-        }
-        if (it != items.end()) {
-            *it = StrategicValue(*it, item);
-        } else {
-            items.push_back(StrategicValue(json::Value(), item));
-        }
+        auto at = server_index(item);
+        if (at >= 0) touched[at] = true;
+        if (item["$patch"].As<std::string>("") == "delete") continue;
+        left.push_back(StrategicValue(at >= 0 ? server[at] : json::Value(), item));
+    }
+    std::vector<Value> right;
+    for (std::size_t i = 0; i < server.size(); ++i) {
+        if (!touched[i]) right.push_back(server[i]);
     }
     json::ValueBuilder out(json::Type::kArray);
-    for (const auto& i : items) out.PushBack(i);
+    std::size_t i = 0, j = 0;
+    while (i < left.size() && j < right.size()) {
+        auto li = server_index(left[i]), ri = server_index(right[j]);
+        if (li >= 0 && ri >= 0 && ri < li) {
+            out.PushBack(right[j++]);
+        } else {
+            out.PushBack(left[i++]);
+        }
+    }
+    for (; i < left.size(); ++i) out.PushBack(left[i]);
+    for (; j < right.size(); ++j) out.PushBack(right[j]);
     return out.ExtractValue();
 }
 

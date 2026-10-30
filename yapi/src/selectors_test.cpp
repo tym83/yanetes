@@ -27,6 +27,8 @@ TEST(FieldSelector, Paths) {
     EXPECT_TRUE(yapi::FieldSelector::Parse("status.phase!=Failed,metadata.name==p").Matches(pod));
     EXPECT_TRUE(yapi::FieldSelector::Parse("spec.nodeName!=").Matches(pod));
     EXPECT_EQ(yapi::FieldSelector::Parse("metadata.namespace=n").Pinned("metadata.namespace"), "n");
+    auto event = userver::formats::json::FromString(R"({"reportingComponent":"ctl"})");
+    EXPECT_TRUE(yapi::FieldSelector::Parse("source.component|reportingComponent=ctl").Matches(event));
     EXPECT_THROW(yapi::FieldSelector::Parse("nonsense"), yapi::ApiError);
 }
 

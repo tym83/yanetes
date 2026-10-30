@@ -162,12 +162,23 @@ bool FieldSelector::Matches(const json::Value& object) const {
     for (const auto& t : terms_) {
         // An absent field is its type's zero, as in the Go structs upstream
         // selects on: spec.unschedulable=false matches a node without it.
-        const auto v = AtPath(object, t.path);
+        // "a|b": the first of the fields that is set.
+        json::Value v;
+        for (std::size_t from = 0;;) {
+            const auto bar = t.path.find('|', from);
+            v = AtPath(object, t.path.substr(from, bar == std::string::npos ? bar : bar - from));
+            if (bar == std::string::npos || !(v.IsMissing() || v.IsNull() || Scalar(v).empty())) break;
+            from = bar + 1;
+        }
         bool eq = (v.IsMissing() || v.IsNull()) ? (t.value.empty() || t.value == "false" || t.value == "0")
                                                 : Scalar(v) == t.value;
         if (eq != t.equal) return false;
     }
     return true;
+}
+
+void FieldSelector::Rename(const std::function<std::string(const std::string&)>& to) {
+    for (auto& t : terms_) t.path = to(t.path);
 }
 
 std::string FieldSelector::Pinned(const std::string& path) const {

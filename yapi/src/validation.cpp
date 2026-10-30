@@ -8,6 +8,7 @@
 #include <vector>
 
 #include <objects.hpp>
+#include <quantity.hpp>
 #include <status.hpp>
 
 namespace yapi::validation {
@@ -75,6 +76,17 @@ void PodSpec(const Value& spec, const std::string& at, Problems& p) {
                 p.push_back(path + ".name: Duplicate value: " + Quote(name));
             }
             if (c["image"].As<std::string>("").empty()) p.push_back(path + ".image: Required value");
+            const auto requests = c["resources"]["requests"], limits = c["resources"]["limits"];
+            if (requests.IsObject() && limits.IsObject()) {
+                for (auto it = requests.begin(); it != requests.end(); ++it) {
+                    const auto res = it.GetName();
+                    if (!limits.HasMember(res)) continue;
+                    const auto want = it->As<std::string>(""), most = limits[res].As<std::string>("");
+                    if (quantity::Parse(want).value_or(0) > quantity::Parse(most).value_or(0)) {
+                        p.push_back(path + ".resources.requests: Invalid value: " + Quote(want) + ": must be less than or equal to " + res + " limit of " + most);
+                    }
+                }
+            }
         }
     }
     if (objects::Items(spec["containers"]).IsEmpty()) p.push_back(at + ".containers: Required value");
