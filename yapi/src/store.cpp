@@ -1,12 +1,18 @@
 #include <store.hpp>
 
+#include <deque>
+#include <map>
+
 #include <userver/components/component_config.hpp>
 #include <userver/components/component_context.hpp>
+#include <userver/engine/future.hpp>
+#include <userver/engine/task/cancel.hpp>
 #include <userver/formats/json/serialize.hpp>
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/formats/serialize/common_containers.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/ydb/component.hpp>
+#include <userver/ydb/io/structs.hpp>
 #include <userver/ydb/table.hpp>
 #include <userver/ydb/transaction.hpp>
 #include <userver/yaml_config/merge_schemas.hpp>
@@ -14,6 +20,37 @@
 #include <watch.hpp>
 
 namespace yapi {
+
+// Rows passed to YDB as lists of structs; the member names are the column
+// names. They may not live in an anonymous namespace.
+namespace rows {
+
+struct Key {
+    userver::ydb::Utf8 res;
+    userver::ydb::Utf8 ns;
+    userver::ydb::Utf8 name;
+    static constexpr userver::ydb::StructMemberNames kYdbMemberNames{};
+};
+
+struct Object {
+    userver::ydb::Utf8 res;
+    userver::ydb::Utf8 ns;
+    userver::ydb::Utf8 name;
+    std::uint64_t rv;
+    std::string value;
+    static constexpr userver::ydb::StructMemberNames kYdbMemberNames{};
+};
+
+struct Event {
+    userver::ydb::Utf8 res;
+    std::uint64_t rv;
+    userver::ydb::Utf8 type;
+    userver::ydb::Utf8 ns;
+    std::string value;
+    static constexpr userver::ydb::StructMemberNames kYdbMemberNames{};
+};
+
+}  // namespace rows
 
 namespace json = userver::formats::json;
 namespace ydb = userver::ydb;
@@ -44,33 +81,28 @@ SELECT value FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
 )",
     Query::Name{"get"}};
 
-const Query kReadForWrite{
+const Query kBatchRead{
     R"(
-DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
+DECLARE $resource AS Utf8;
+DECLARE $keys AS List<Struct<res:Utf8, ns:Utf8, name:Utf8>>;
 SELECT rv FROM revisions WHERE res = $resource;
-SELECT value FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
+SELECT o.ns AS ns, o.name AS name, o.value AS value
+FROM AS_TABLE($keys) AS k INNER JOIN objects AS o ON o.res = k.res AND o.ns = k.ns AND o.name = k.name;
 )",
-    Query::Name{"read-for-write"}};
+    Query::Name{"batch-read"}};
 
-const Query kPut{
+const Query kBatchWrite{
     R"(
-DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
-DECLARE $rv AS Uint64; DECLARE $value AS String; DECLARE $type AS Utf8;
+DECLARE $resource AS Utf8; DECLARE $rv AS Uint64;
+DECLARE $puts AS List<Struct<res:Utf8, ns:Utf8, name:Utf8, rv:Uint64, value:String>>;
+DECLARE $dels AS List<Struct<res:Utf8, ns:Utf8, name:Utf8>>;
+DECLARE $events AS List<Struct<res:Utf8, rv:Uint64, type:Utf8, ns:Utf8, value:String>>;
 UPSERT INTO revisions (res, rv) VALUES ($resource, $rv);
-UPSERT INTO objects (res, ns, name, rv, value) VALUES ($resource, $ns, $name, $rv, $value);
-UPSERT INTO events (res, rv, type, ns, value) VALUES ($resource, $rv, $type, $ns, $value);
+UPSERT INTO objects SELECT * FROM AS_TABLE($puts);
+DELETE FROM objects ON SELECT * FROM AS_TABLE($dels);
+UPSERT INTO events SELECT * FROM AS_TABLE($events);
 )",
-    Query::Name{"put"}};
-
-const Query kRemove{
-    R"(
-DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
-DECLARE $rv AS Uint64; DECLARE $value AS String;
-UPSERT INTO revisions (res, rv) VALUES ($resource, $rv);
-DELETE FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
-UPSERT INTO events (res, rv, type, ns, value) VALUES ($resource, $rv, "DELETED"u, $ns, $value);
-)",
-    Query::Name{"remove"}};
+    Query::Name{"batch-write"}};
 
 const Query kListAll{
     R"(
@@ -133,7 +165,7 @@ Store::Store(const userver::components::ComponentConfig& config, const userver::
     EnsureSchema();
 }
 
-Store::~Store() = default;
+Store::~Store() { tasks_.CancelAndWait(); }
 
 userver::yaml_config::Schema Store::GetStaticConfigSchema() {
     return userver::yaml_config::MergeSchemas<ComponentBase>(R"(
@@ -213,65 +245,159 @@ Store::Page Store::List(
     return page;
 }
 
+// A write waiting for its batch.
+struct Store::Pending {
+    std::string ns, name;
+    const Decide* decide = nullptr;
+    userver::engine::Promise<Decision> promise;
+};
+
+struct Store::Batcher {
+    const Resource* resource = nullptr;
+    userver::engine::Mutex mutex;
+    std::deque<Pending*> queue;
+    userver::engine::SingleConsumerEvent kick;
+};
+
+namespace {
+// A batch big enough to spread the cost of a commit, small enough to keep
+// a retried transaction cheap.
+constexpr std::size_t kMaxBatch = 256;
+}  // namespace
+
+Store::Batcher& Store::BatcherFor(const Resource& r) {
+    std::unique_lock lock(batchers_mutex_);
+    auto& slot = batchers_[r.Key()];
+    if (!slot) {
+        slot = std::make_unique<Batcher>();
+        slot->resource = &r;
+        auto* b = slot.get();
+        tasks_.AsyncDetach("write-" + r.Key(), [this, b] { RunBatcher(*b); });
+    }
+    return *slot;
+}
+
 Decision Store::Write(const Resource& r, const std::string& ns, const std::string& name, const Decide& decide) {
-    Decision result;
-    std::uint64_t written = 0;
-    userver::ydb::RetryTxSettings settings;
-    settings.tx_mode = ydb::TransactionMode::kSerializableRW;
-    table_->RetryTx("write", settings, [&](ydb::TxActor& tx) -> ydb::TxAction {
-        written = 0;
-        auto read = tx.Execute(
-            kReadForWrite, "$resource", ydb::Utf8{r.Key()}, "$ns", ydb::Utf8{ns}, "$name", ydb::Utf8{name}
-        );
-        std::uint64_t rv = FirstRv(read.GetCursor(0));
-        std::optional<json::Value> current;
-        for (auto row : read.GetCursor(1)) {
-            current = json::FromString(row.Get<std::optional<std::string>>("value").value_or("{}"));
+    Pending p{ns, name, &decide, {}};
+    auto result = p.promise.get_future();
+    auto& b = BatcherFor(r);
+    {
+        std::unique_lock lock(b.mutex);
+        b.queue.push_back(&p);
+    }
+    b.kick.Send();
+    return result.get();
+}
+
+void Store::RunBatcher(Batcher& b) {
+    while (!userver::engine::current_task::ShouldCancel()) {
+        (void)b.kick.WaitForEvent();
+        for (;;) {
+            std::vector<Pending*> batch;
+            {
+                std::unique_lock lock(b.mutex);
+                while (!b.queue.empty() && batch.size() < kMaxBatch) {
+                    batch.push_back(b.queue.front());
+                    b.queue.pop_front();
+                }
+            }
+            if (batch.empty()) break;
+            Commit(*b.resource, batch);
         }
-        result = decide(current);
-        if (result.action == Decision::Action::kKeep) {
-            if (current) result.object = *current;
+    }
+}
+
+void Store::Commit(const Resource& r, std::vector<Pending*>& batch) {
+    struct Outcome {
+        Decision decision;
+        std::exception_ptr error;
+    };
+    std::vector<Outcome> outcomes;
+    bool written = false;
+    try {
+        userver::ydb::RetryTxSettings settings;
+        settings.tx_mode = ydb::TransactionMode::kSerializableRW;
+        settings.retries = 10;
+        table_->RetryTx("write", settings, [&](ydb::TxActor& tx) -> ydb::TxAction {
+            outcomes.assign(batch.size(), Outcome{});
+            written = false;
+            const ydb::Utf8 res{r.Key()};
+            std::vector<rows::Key> keys;
+            std::map<std::pair<std::string, std::string>, std::optional<json::Value>> view;
+            for (auto* p : batch) {
+                if (view.emplace(std::make_pair(p->ns, p->name), std::nullopt).second) {
+                    keys.push_back({res, ydb::Utf8{p->ns}, ydb::Utf8{p->name}});
+                }
+            }
+            auto read = tx.Execute(kBatchRead, "$resource", res, "$keys", keys);
+            std::uint64_t rv = FirstRv(read.GetCursor(0));
+            for (auto row : read.GetCursor(1)) {
+                auto key = std::make_pair(
+                    row.Get<std::optional<ydb::Utf8>>("ns").value_or(ydb::Utf8{}).GetUnderlying(),
+                    row.Get<std::optional<ydb::Utf8>>("name").value_or(ydb::Utf8{}).GetUnderlying()
+                );
+                view[key] = json::FromString(row.Get<std::optional<std::string>>("value").value_or("{}"));
+            }
+            // Each write sees the ones before it in the batch; only the last
+            // state of an object is stored, every step goes to the log.
+            std::map<std::pair<std::string, std::string>, std::optional<rows::Object>> last;
+            std::vector<rows::Event> events;
+            for (std::size_t i = 0; i < batch.size(); ++i) {
+                auto key = std::make_pair(batch[i]->ns, batch[i]->name);
+                auto& current = view[key];
+                Decision d;
+                try {
+                    d = (*batch[i]->decide)(current);
+                } catch (...) {
+                    outcomes[i].error = std::current_exception();
+                    continue;
+                }
+                if (d.action == Decision::Action::kKeep) {
+                    if (current) d.object = *current;
+                    outcomes[i].decision = std::move(d);
+                    continue;
+                }
+                ++rv;
+                d.object = WithRv(d.object, rv);
+                auto value = json::ToString(d.object);
+                const bool put = d.action == Decision::Action::kPut;
+                events.push_back({res, rv, ydb::Utf8{put ? (current ? "MODIFIED" : "ADDED") : "DELETED"}, ydb::Utf8{key.first}, value});
+                if (put) {
+                    last[key] = rows::Object{res, ydb::Utf8{key.first}, ydb::Utf8{key.second}, rv, value};
+                    current = d.object;
+                } else {
+                    last[key] = std::nullopt;
+                    current = std::nullopt;
+                }
+                outcomes[i].decision = std::move(d);
+            }
+            if (events.empty()) return ydb::TxAction::kCommit;
+            std::vector<rows::Object> puts;
+            std::vector<rows::Key> dels;
+            for (auto& [key, row] : last) {
+                if (row) {
+                    puts.push_back(std::move(*row));
+                } else {
+                    dels.push_back({res, ydb::Utf8{key.first}, ydb::Utf8{key.second}});
+                }
+            }
+            tx.Execute(kBatchWrite, "$resource", res, "$rv", rv, "$puts", puts, "$dels", dels, "$events", events);
+            written = true;
             return ydb::TxAction::kCommit;
-        }
-        std::uint64_t next = rv + 1;
-        result.object = WithRv(result.object, next);
-        auto value = json::ToString(result.object);
-        if (result.action == Decision::Action::kPut) {
-            tx.Execute(
-                kPut,
-                "$resource",
-                ydb::Utf8{r.Key()},
-                "$ns",
-                ydb::Utf8{ns},
-                "$name",
-                ydb::Utf8{name},
-                "$rv",
-                next,
-                "$value",
-                value,
-                "$type",
-                ydb::Utf8{current ? "MODIFIED" : "ADDED"}
-            );
+        });
+    } catch (...) {
+        auto error = std::current_exception();
+        for (auto* p : batch) p->promise.set_exception(error);
+        return;
+    }
+    if (written && watch_ != nullptr) watch_->Kick(r);
+    for (std::size_t i = 0; i < batch.size(); ++i) {
+        if (outcomes[i].error) {
+            batch[i]->promise.set_exception(outcomes[i].error);
         } else {
-            tx.Execute(
-                kRemove,
-                "$resource",
-                ydb::Utf8{r.Key()},
-                "$ns",
-                ydb::Utf8{ns},
-                "$name",
-                ydb::Utf8{name},
-                "$rv",
-                next,
-                "$value",
-                value
-            );
+            batch[i]->promise.set_value(std::move(outcomes[i].decision));
         }
-        written = next;
-        return ydb::TxAction::kCommit;
-    });
-    if (written != 0 && watch_ != nullptr) watch_->Kick(r);
-    return result;
+    }
 }
 
 std::uint64_t Store::Revision(const Resource& r) {

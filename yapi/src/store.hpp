@@ -5,9 +5,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <userver/components/component_base.hpp>
+#include <userver/concurrent/background_task_storage.hpp>
+#include <userver/engine/mutex.hpp>
+#include <userver/engine/single_consumer_event.hpp>
 #include <userver/formats/json/value.hpp>
 #include <userver/ydb/fwd.hpp>
 
@@ -39,7 +43,9 @@ struct WatchEvent {
 // Objects live in YDB, one revision counter per resource: Kubernetes only
 // compares resourceVersions within a resource, so writes to pods and to
 // leases never queue behind each other the way they do behind etcd's one
-// revision.
+// revision. Writes to one resource are committed in batches: each batch is
+// one transaction that bumps the counter once, so concurrent writers do not
+// fight over its row.
 class Store final : public userver::components::ComponentBase {
 public:
     static constexpr std::string_view kName = "yapi-store";
@@ -64,9 +70,11 @@ public:
         const std::string& after_name
     );
 
-    // Reads the object (if any) and applies the decision in one transaction;
-    // decide runs again if the transaction is retried. Returns the decision
-    // as stored: a kept object comes back as found.
+    // Reads the object (if any) and applies the decision in one transaction,
+    // possibly together with other writes to the same resource; decide runs
+    // again if the transaction is retried, and must not write to the same
+    // resource itself. Returns the decision as stored: a kept object comes
+    // back as found. What decide throws comes back from Write.
     using Decide = std::function<Decision(const std::optional<userver::formats::json::Value>& current)>;
     Decision Write(const Resource& r, const std::string& ns, const std::string& name, const Decide& decide);
 
@@ -80,10 +88,19 @@ public:
     void SetWatch(Watch* watch) { watch_ = watch; }
 
 private:
+    struct Pending;
+    struct Batcher;
+
     void EnsureSchema();
+    Batcher& BatcherFor(const Resource& r);
+    void RunBatcher(Batcher& b);
+    void Commit(const Resource& r, std::vector<Pending*>& batch);
 
     std::shared_ptr<userver::ydb::TableClient> table_;
     Watch* watch_ = nullptr;
+    userver::engine::Mutex batchers_mutex_;
+    std::unordered_map<std::string, std::unique_ptr<Batcher>> batchers_;
+    userver::concurrent::BackgroundTaskStorage tasks_;
 };
 
 }  // namespace yapi
