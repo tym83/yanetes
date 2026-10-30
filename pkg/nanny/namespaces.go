@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -98,8 +99,14 @@ func (n *Namespaces) sync(ctx context.Context, name string) error {
 		n.mu.Unlock()
 		return fmt.Errorf("discovery lists no pods; not finalizing %s", name)
 	}
-	remaining := 0
-	for _, gvr := range resources {
+	// Pods go first and alone, as upstream orders it: what they use
+	// (config maps, secrets, claims) stays until they are gone.
+	pods := schema.GroupVersionResource{Version: "v1", Resource: "pods"}
+	order := append([]schema.GroupVersionResource{pods}, slices.DeleteFunc(slices.Clone(resources), func(g schema.GroupVersionResource) bool { return g == pods })...)
+	remaining := map[string]int{}
+	finalizers := map[string]int{}
+	var failure string
+	for i, gvr := range order {
 		list, err := n.meta.Resource(gvr).Namespace(name).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			if apierrors.IsNotFound(err) || apierrors.IsMethodNotSupported(err) {
@@ -110,15 +117,31 @@ func (n *Namespaces) sync(ctx context.Context, name string) error {
 		if len(list.Items) == 0 {
 			continue
 		}
-		remaining += len(list.Items)
+		key := gvr.Resource
+		if gvr.Group != "" {
+			key += "." + gvr.Group
+		}
+		remaining[key] += len(list.Items)
+		for _, item := range list.Items {
+			for _, f := range item.Finalizers {
+				finalizers[f]++
+			}
+		}
 		background := metav1.DeletePropagationBackground
 		err = n.meta.Resource(gvr).Namespace(name).DeleteCollection(ctx,
 			metav1.DeleteOptions{PropagationPolicy: &background}, metav1.ListOptions{})
 		if err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
+		if i == 0 {
+			failure = fmt.Sprintf("Failed to delete all resource types, 1 remaining: unexpected items still remain in namespace: %s for gvr: /v1, Resource=pods", name)
+			break
+		}
 	}
-	if remaining > 0 {
+	if err := n.reportProgress(ctx, ns, remaining, finalizers, failure); err != nil {
+		return err
+	}
+	if len(remaining) > 0 {
 		// Pods leave when their kubelets say so; look again shortly.
 		return later(2 * time.Second)
 	}
@@ -128,6 +151,68 @@ func (n *Namespaces) sync(ctx context.Context, name string) error {
 	})
 	_, err = n.client.CoreV1().Namespaces().Finalize(ctx, ns, metav1.UpdateOptions{})
 	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	return err
+}
+
+// reportProgress writes the namespace's deletion conditions the way the
+// upstream controller words them.
+func (n *Namespaces) reportProgress(ctx context.Context, ns *corev1.Namespace, remaining, finalizers map[string]int, failure string) error {
+	now := metav1.Now()
+	cond := func(t corev1.NamespaceConditionType, on bool, yes, no, msg string) corev1.NamespaceCondition {
+		c := corev1.NamespaceCondition{Type: t, Status: corev1.ConditionFalse, Reason: no, LastTransitionTime: now}
+		if on {
+			c.Status, c.Reason, c.Message = corev1.ConditionTrue, yes, msg
+		} else if t == corev1.NamespaceDeletionContentFailure {
+			c.Message = "All content successfully deleted, may be waiting on finalization"
+		} else if t == corev1.NamespaceContentRemaining {
+			c.Message = "All content successfully removed"
+		} else if t == corev1.NamespaceFinalizersRemaining {
+			c.Message = "All content-preserving finalizers finished"
+		} else {
+			c.Message = "All resources successfully discovered"
+		}
+		for _, old := range ns.Status.Conditions {
+			if old.Type == t && old.Status == c.Status {
+				c.LastTransitionTime = old.LastTransitionTime
+			}
+		}
+		return c
+	}
+	var left, held []string
+	for k, v := range remaining {
+		left = append(left, fmt.Sprintf("%s has %d resource instances", k, v))
+	}
+	for k, v := range finalizers {
+		held = append(held, fmt.Sprintf("%s in %d resource instances", k, v))
+	}
+	slices.Sort(left)
+	slices.Sort(held)
+	want := []corev1.NamespaceCondition{
+		cond(corev1.NamespaceDeletionDiscoveryFailure, false, "", "ResourcesDiscovered", ""),
+		cond(corev1.NamespaceDeletionGVParsingFailure, false, "", "ParsedGroupVersions", ""),
+		cond(corev1.NamespaceDeletionContentFailure, failure != "", "ContentDeletionFailed", "ContentDeleted", failure),
+		cond(corev1.NamespaceContentRemaining, len(left) > 0, "SomeResourcesRemain", "ContentRemoved", "Some resources are remaining: "+strings.Join(left, ", ")),
+		cond(corev1.NamespaceFinalizersRemaining, len(held) > 0, "SomeFinalizersRemain", "ContentHasNoFinalizers", "Some content in the namespace has finalizers remaining: "+strings.Join(held, ", ")),
+	}
+	for i := range want {
+		if want[i].Type == corev1.NamespaceDeletionGVParsingFailure {
+			want[i].Message = "All legacy kube types successfully parsed"
+		}
+	}
+	same := len(want) == len(ns.Status.Conditions)
+	for i := 0; same && i < len(want); i++ {
+		o := ns.Status.Conditions[i]
+		same = o.Type == want[i].Type && o.Status == want[i].Status && o.Reason == want[i].Reason && o.Message == want[i].Message
+	}
+	if same {
+		return nil
+	}
+	ns = ns.DeepCopy()
+	ns.Status.Conditions = want
+	_, err := n.client.CoreV1().Namespaces().UpdateStatus(ctx, ns, metav1.UpdateOptions{})
+	if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 		return nil
 	}
 	return err

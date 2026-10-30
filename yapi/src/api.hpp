@@ -58,6 +58,7 @@ private:
     std::string Review(const Resource& r, const userver::server::http::HttpRequest& request, const User& user) const;
     std::string Proxy(const userver::server::http::HttpRequest& request, const Resource& r, const std::string& ns,
                       const std::string& spec, const std::string& path) const;
+    std::string WebSocketLog(const userver::server::http::HttpRequest& request, std::string body) const;
     std::string Kubelet(const userver::server::http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub) const;
     std::pair<std::unique_ptr<kubelet::Connection>, std::string> KubeletTarget(
         const userver::server::http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub

@@ -1,6 +1,7 @@
 #include <api.hpp>
 
 #include <fstream>
+#include <openssl/sha.h>
 #include <functional>
 #include <tuple>
 #include <sstream>
@@ -1196,6 +1197,19 @@ void Api::Evict(const std::string& ns, const std::string& name, const Value& opt
         if ((*current)["spec"]["nodeName"].As<std::string>("").empty()) grace = 0;
         b["metadata"]["deletionTimestamp"] = objects::Now();
         b["metadata"]["deletionGracePeriodSeconds"] = grace;
+        // Why it goes, for the job controller's failure policies.
+        ValueBuilder conditions(json::Type::kArray);
+        for (const auto& c : objects::Items((*current)["status"]["conditions"])) {
+            if (c["type"].As<std::string>("") != "DisruptionTarget") conditions.PushBack(c);
+        }
+        ValueBuilder target(json::Type::kObject);
+        target["type"] = "DisruptionTarget";
+        target["status"] = "True";
+        target["reason"] = "EvictionByEvictionAPI";
+        target["message"] = "Eviction API: evicting";
+        target["lastTransitionTime"] = objects::Now();
+        conditions.PushBack(target.ExtractValue());
+        b["status"]["conditions"] = conditions;
         auto next = b.ExtractValue();
         return Releasable(pods, next) ? Decision::Remove(next) : Decision::Put(next);
     });
@@ -1258,7 +1272,17 @@ std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns
         headers.emplace_back(h, request.GetHeader(h));
     }
     headers.emplace_back("Host", "kubelet");
-    const bool upgrade = !request.GetHeader("Upgrade").empty();
+    // Logs over a WebSocket: the kubelet answers plainly, and the server
+    // frames the answer itself, as upstream wraps log streams.
+    const bool ws_log = sub == "log" && !request.GetHeader("Upgrade").empty();
+    const bool upgrade = !request.GetHeader("Upgrade").empty() && !ws_log;
+    if (ws_log) {
+        headers.erase(std::remove_if(headers.begin(), headers.end(), [](const auto& h) {
+            std::string k = h.first;
+            for (auto& c : k) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            return k == "upgrade" || k == "connection" || k.starts_with("sec-websocket");
+        }), headers.end());
+    }
     if (!upgrade) headers.emplace_back("Connection", "close");
     conn->Request(upgrade ? request.GetMethodStr() : "GET", target, headers, deadline);
     auto head = conn->ReadHead(deadline);
@@ -1279,6 +1303,7 @@ std::string Api::Kubelet(const http::HttpRequest& request, const std::string& ns
     response.SetContentType(content_type.empty() ? "text/plain" : content_type);
     std::string body, piece;
     while (conn->ReadBody(piece, deadline)) body += piece;
+    if (ws_log && head.status == 200) return WebSocketLog(request, std::move(body));
     return body;
 }
 
@@ -1475,6 +1500,55 @@ std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, cons
         }
     }
     return body;
+}
+
+std::string Api::WebSocketLog(const http::HttpRequest& request, std::string body) const {
+    const auto key = request.GetHeader("Sec-WebSocket-Key");
+    std::string protocol;
+    for (const char* p : {"base64.binary.k8s.io", "binary.k8s.io"}) {
+        if (protocol.empty() && request.GetHeader("Sec-WebSocket-Protocol").find(p) != std::string::npos) protocol = p;
+    }
+    unsigned char digest[SHA_DIGEST_LENGTH];
+    const auto accept_src = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    SHA1(reinterpret_cast<const unsigned char*>(accept_src.data()), accept_src.size(), digest);
+    auto& response = request.GetHttpResponse();
+    response.SetStatus(http::HttpStatus::kSwitchingProtocols);
+    response.SetHeader(std::string("Upgrade"), std::string("websocket"));
+    response.SetHeader(std::string("Connection"), std::string("Upgrade"));
+    response.SetHeader(std::string("Sec-WebSocket-Accept"),
+                       userver::crypto::base64::Base64Encode(std::string_view(reinterpret_cast<const char*>(digest), sizeof(digest))));
+    if (!protocol.empty()) response.SetHeader(std::string("Sec-WebSocket-Protocol"), protocol);
+    const bool text = protocol == "base64.binary.k8s.io";
+    if (text) body = userver::crypto::base64::Base64Encode(body);
+    request.SetUpgradeWebsocket([body = std::move(body), text](std::unique_ptr<userver::engine::io::RwBase>&& client, userver::engine::io::Sockaddr&&) {
+        // One frame with the whole log, then a normal close.
+        auto frame = [](unsigned char opcode, const std::string& payload) {
+            std::string f(1, static_cast<char>(0x80 | opcode));
+            const auto n = payload.size();
+            if (n < 126) {
+                f += static_cast<char>(n);
+            } else if (n < 65536) {
+                f += static_cast<char>(126);
+                f += static_cast<char>((n >> 8) & 0xFF);
+                f += static_cast<char>(n & 0xFF);
+            } else {
+                f += static_cast<char>(127);
+                for (int i = 7; i >= 0; --i) f += static_cast<char>((static_cast<std::uint64_t>(n) >> (8 * i)) & 0xFF);
+            }
+            return f + payload;
+        };
+        const auto deadline = userver::engine::Deadline::FromDuration(std::chrono::seconds(30));
+        try {
+            auto data = frame(text ? 0x1 : 0x2, body);
+            auto close = frame(0x8, std::string("\x03\xe8", 2));
+            (void)client->WriteAll(data.data(), data.size(), deadline);
+            (void)client->WriteAll(close.data(), close.size(), deadline);
+            char buf[256];
+            (void)client->ReadSome(buf, sizeof(buf), deadline);  // the client's close
+        } catch (const std::exception&) {
+        }
+    });
+    return "";
 }
 
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {
