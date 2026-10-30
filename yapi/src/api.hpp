@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <userver/clients/http/client.hpp>
 #include <userver/server/handlers/http_handler_base.hpp>
 
 #include <registry.hpp>
@@ -50,6 +51,8 @@ private:
     std::string Handle(const userver::server::http::HttpRequest& request) const;
     // Reviews and the like: answered, not stored.
     std::string Review(const Resource& r, const userver::server::http::HttpRequest& request, const User& user) const;
+    std::string Proxy(const userver::server::http::HttpRequest& request, const Resource& r, const std::string& ns,
+                      const std::string& spec, const std::string& path) const;
     std::string Kubelet(const userver::server::http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub) const;
     std::pair<std::unique_ptr<kubelet::Connection>, std::string> KubeletTarget(
         const userver::server::http::HttpRequest& request, const std::string& ns, const std::string& name, const std::string& sub
@@ -70,6 +73,7 @@ private:
     Services& services_;
     Crds& crds_;
     Webhooks& webhooks_;
+    userver::clients::http::Client& http_;
     const Registry& registry_;
     std::string openapi_dir_;
 };

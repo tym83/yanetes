@@ -106,6 +106,7 @@ int main(int argc, char* argv[]) {
     // userver matches whole path segments, so the API is registered once per depth.
     for (const char* name : {"api-0", "api-1", "api-2", "api-3", "api-4", "api-5", "api-6", "api-7", "api-8",
                              "apis-0", "apis-1", "apis-2", "apis-3", "apis-4", "apis-5", "apis-6", "apis-7", "apis-8",
+                             "api-9", "api-10", "api-11", "api-12", "apis-9", "apis-10", "apis-11", "apis-12",
                              "server-1", "openapi-2", "openapi-3", "openapi-4", "openapi-5",
                              "well-known-2", "openid-3"}) {
         list.Append<yapi::Api>(name);

@@ -6,6 +6,7 @@
 #include <sstream>
 
 #include <userver/components/component_config.hpp>
+#include <userver/clients/http/component.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/crypto/base64.hpp>
 #include <userver/engine/deadline.hpp>
@@ -28,6 +29,7 @@
 #include <crds.hpp>
 #include <kubelet.hpp>
 #include <objects.hpp>
+#include <openapi.hpp>
 #include <patch.hpp>
 #include <proto.hpp>
 #include <schema.hpp>
@@ -376,6 +378,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       services_(context.FindComponent<Services>()),
       crds_(context.FindComponent<Crds>()),
       webhooks_(context.FindComponent<Webhooks>()),
+      http_(context.FindComponent<userver::components::HttpClient>().GetHttpClient()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
 
@@ -441,17 +444,18 @@ std::string Api::Handle(const http::HttpRequest& request) const {
     }
 
     if (!parts.empty() && parts[0] == "openapi") {
-        std::string file;
-        if (parts.size() == 2 && parts[1] == "v2") file = openapi_dir_ + "/swagger.json";
-        if (parts.size() == 2 && parts[1] == "v3") file = openapi_dir_ + "/v3/index.json";
+        // One copy of the documents for every handler instance.
+        static const openapi::Documents docs(openapi_dir_);
+        std::optional<std::string> body;
+        if (parts.size() == 2 && parts[1] == "v2") body = docs.V2(registry_);
+        if (parts.size() == 2 && parts[1] == "v3") body = docs.V3Index(registry_);
         if (parts.size() > 2 && parts[1] == "v3") {
-            std::string name;
-            for (std::size_t i = 2; i < parts.size(); ++i) name += (i > 2 ? "__" : "") + parts[i];
-            file = openapi_dir_ + "/v3/" + name + "_openapi.json";
+            std::string path;
+            for (std::size_t i = 2; i < parts.size(); ++i) path += (i > 2 ? "/" : "") + parts[i];
+            body = docs.V3(registry_, path);
         }
-        auto body = file.empty() ? "" : ReadFile(file);
-        if (body.empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
-        return body;
+        if (!body || body->empty()) throw ApiError(404, "NotFound", "the server could not find the requested resource");
+        return *body;
     }
 
     if (parts.empty() || (parts[0] != "api" && parts[0] != "apis")) {
@@ -516,6 +520,13 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         rest.erase(rest.begin(), rest.begin() + 2);
     }
     t.resource = registry_.Find(group, version, rest[0]);
+    if (t.resource && rest.size() >= 3 && rest[2] == "proxy" &&
+        (IsPod(*t.resource) || IsService(*t.resource) || (t.resource->group.empty() && t.resource->plural == "nodes"))) {
+        std::string path;
+        for (std::size_t i = 3; i < rest.size(); ++i) path += "/" + rest[i];
+        if (path.empty() || request.GetRequestPath().ends_with("/")) path += "/";
+        return Proxy(request, *t.resource, t.ns, rest[1], path);
+    }
     if (!t.resource || rest.size() > 3) {
         throw ApiError(404, "NotFound", "the server could not find the requested resource");
     }
@@ -1112,6 +1123,105 @@ Value Api::CheckFields(const Resource& r, const Value& object, const std::string
     }
     request.GetHttpResponse().SetHeader(std::string("Warning"), warning);
     return out;
+}
+
+std::string Api::Proxy(const http::HttpRequest& request, const Resource& r, const std::string& ns, const std::string& spec, const std::string& path) const {
+    // [scheme:]name[:port], as upstream spells the proxy target.
+    std::vector<std::string> parts;
+    std::stringstream ss(spec);
+    for (std::string p; std::getline(ss, p, ':');) parts.push_back(p);
+    std::string scheme, name, port;
+    if (parts.size() == 3) {
+        scheme = parts[0], name = parts[1], port = parts[2];
+    } else if (parts.size() == 2) {
+        name = parts[0], port = parts[1];
+    } else {
+        name = spec;
+    }
+    std::string host;
+    bool verify = true;
+    if (IsPod(r)) {
+        auto pod = store_.Get(r, ns, name);
+        if (!pod) throw NotFound("pods", "", name);
+        host = (*pod)["status"]["podIP"].As<std::string>("");
+        if (host.empty()) throw ApiError(503, "ServiceUnavailable", "address not allowed");
+        if (scheme.empty()) scheme = "http";
+    } else if (IsService(r)) {
+        auto svc = store_.Get(r, ns, name);
+        if (!svc) throw NotFound("services", "", name);
+        // The service port by name or number, then a ready endpoint behind it.
+        std::string port_name;
+        bool found = port.empty();
+        for (const auto& p : objects::Items((*svc)["spec"]["ports"])) {
+            if (port.empty() || p["name"].As<std::string>("") == port || std::to_string(p["port"].As<int>(0)) == port) {
+                port_name = p["name"].As<std::string>("");
+                found = true;
+                break;
+            }
+        }
+        if (!found) throw ApiError(503, "ServiceUnavailable", "no endpoints available for service \"" + name + "\"");
+        const auto& slices = *registry_.Find("discovery.k8s.io", "v1", "endpointslices");
+        port.clear();
+        for (const auto& slice : store_.List(slices, ns, 0, "", "").items) {
+            if (slice["metadata"]["labels"]["kubernetes.io/service-name"].As<std::string>("") != name) continue;
+            std::string slice_port;
+            for (const auto& p : objects::Items(slice["ports"])) {
+                if (p["name"].As<std::string>("") == port_name) slice_port = std::to_string(p["port"].As<int>(0));
+            }
+            if (slice_port.empty()) continue;
+            for (const auto& e : objects::Items(slice["endpoints"])) {
+                if (!e["conditions"]["ready"].As<bool>(true)) continue;
+                for (const auto& a : objects::Items(e["addresses"])) {
+                    host = a.As<std::string>("");
+                    port = slice_port;
+                    break;
+                }
+                if (!host.empty()) break;
+            }
+            if (!host.empty()) break;
+        }
+        if (host.empty()) throw ApiError(503, "ServiceUnavailable", "no endpoints available for service \"" + name + "\"");
+        if (scheme.empty()) scheme = "http";
+    } else {
+        auto node = store_.Get(r, "", name);
+        if (!node) throw NotFound("nodes", "", name);
+        for (const auto& a : objects::Items((*node)["status"]["addresses"])) {
+            if (a["type"].As<std::string>("") == "InternalIP") host = a["address"].As<std::string>("");
+        }
+        if (port.empty()) port = std::to_string((*node)["status"]["daemonEndpoints"]["kubeletEndpoint"]["Port"].As<int>(10250));
+        if (scheme.empty()) scheme = port == "10250" ? "https" : "http";
+        verify = false;  // the kubelet's own certificate, as upstream
+    }
+    std::string url = scheme + "://" + host + (port.empty() ? "" : ":" + port) + path;
+    std::string query;
+    for (const auto& arg : request.ArgNames()) {
+        for (const auto& v : request.GetArgVector(arg)) {
+            query += (query.empty() ? "?" : "&") + userver::http::UrlEncode(arg) + "=" + userver::http::UrlEncode(v);
+        }
+    }
+    namespace client = userver::clients::http;
+    auto out = http_.CreateRequest();
+    out.method(client::HttpMethodFromString(request.GetMethodStr())).url(url + query).timeout(std::chrono::seconds(30)).verify(verify);
+    if (!request.RequestBody().empty()) out.data(request.RequestBody());
+    client::Headers headers;
+    for (const auto& h : request.GetHeaderNames()) {
+        if (h == "Authorization" || h == "Host" || h == "Content-Length" || h == "Connection") continue;
+        headers.emplace(h, request.GetHeader(h));
+    }
+    out.headers(headers);
+    std::shared_ptr<client::Response> answer;
+    try {
+        answer = out.perform();
+    } catch (const std::exception& e) {
+        throw ApiError(503, "ServiceUnavailable", std::string("error trying to reach ") + r.singular + ": " + e.what());
+    }
+    auto& response = request.GetHttpResponse();
+    response.SetStatus(static_cast<http::HttpStatus>(static_cast<int>(answer->status_code())));
+    for (const auto& [k, v] : answer->headers()) {
+        if (k == "Content-Length" || k == "Transfer-Encoding" || k == "Connection") continue;
+        response.SetHeader(std::string(k), v);
+    }
+    return answer->body();
 }
 
 std::string Api::Review(const Resource& r, const http::HttpRequest& request, const User& user) const {

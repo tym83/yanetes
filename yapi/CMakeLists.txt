@@ -29,6 +29,7 @@ add_library(yapi_objs OBJECT
     src/crds.cpp
     src/webhooks.cpp
     src/quantity.cpp
+    src/openapi.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
 find_package(Protobuf REQUIRED)
