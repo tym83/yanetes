@@ -19,9 +19,11 @@ add_library(yapi_objs OBJECT
     src/selectors.cpp
     src/api.cpp
     src/status.cpp
+    src/proto.cpp
 )
 target_include_directories(yapi_objs PUBLIC src)
-target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb)
+find_package(Protobuf REQUIRED)
+target_link_libraries(yapi_objs PUBLIC userver::core userver::ydb protobuf::libprotoc protobuf::libprotobuf)
 
 add_executable(yapi src/main.cpp)
 target_link_libraries(yapi PRIVATE yapi_objs)

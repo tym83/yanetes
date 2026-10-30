@@ -131,11 +131,13 @@ Value Defaults(const Resource& r, Value object) {
         SetIfMissing(spec, "replicas", 1);
         SetIfMissing(spec, "revisionHistoryLimit", 10);
         SetIfMissing(spec, "progressDeadlineSeconds", 600);
-        if (!spec.HasMember("strategy")) {
-            json::ValueBuilder s(json::Type::kObject);
-            s["type"] = "RollingUpdate";
-            s["rollingUpdate"]["maxSurge"] = "25%";
-            s["rollingUpdate"]["maxUnavailable"] = "25%";
+        const auto strategy = object["spec"]["strategy"];
+        auto type = strategy["type"].As<std::string>("RollingUpdate");
+        if (type == "RollingUpdate") {
+            json::ValueBuilder s(strategy.IsObject() ? strategy : json::ValueBuilder(json::Type::kObject).ExtractValue());
+            s["type"] = type;
+            if (strategy["rollingUpdate"]["maxSurge"].IsMissing()) s["rollingUpdate"]["maxSurge"] = "25%";
+            if (strategy["rollingUpdate"]["maxUnavailable"].IsMissing()) s["rollingUpdate"]["maxUnavailable"] = "25%";
             spec["strategy"] = s;
         }
     }

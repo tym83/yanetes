@@ -1,13 +1,17 @@
 #include <userver/components/component_base.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/components/minimal_server_component_list.hpp>
+#include <userver/storages/secdist/component.hpp>
+#include <userver/storages/secdist/provider_component.hpp>
 #include <userver/formats/json/value_builder.hpp>
 #include <userver/logging/log.hpp>
 #include <userver/utils/daemon_run.hpp>
 #include <userver/ydb/component.hpp>
+#include <userver/yaml_config/merge_schemas.hpp>
 
 #include <api.hpp>
 #include <objects.hpp>
+#include <proto.hpp>
 #include <registry.hpp>
 #include <store.hpp>
 #include <watch.hpp>
@@ -35,14 +39,44 @@ public:
     }
 };
 
+// The protobuf schemas clients send typed objects in.
+class Protobuf final : public userver::components::ComponentBase {
+public:
+    static constexpr std::string_view kName = "yapi-protobuf";
+
+    Protobuf(const userver::components::ComponentConfig& config, const userver::components::ComponentContext& context)
+        : ComponentBase(config, context), decoder_(config["proto-dir"].As<std::string>()) {
+        proto::Decoder::SetInstance(&decoder_);
+    }
+    ~Protobuf() override { proto::Decoder::SetInstance(nullptr); }
+
+    static userver::yaml_config::Schema GetStaticConfigSchema() {
+        return userver::yaml_config::MergeSchemas<ComponentBase>(R"(
+type: object
+description: protobuf schemas of the Kubernetes types
+additionalProperties: false
+properties:
+    proto-dir:
+        type: string
+        description: directory holding k8s.io/api, k8s.io/apimachinery and k8s.io/apiextensions-apiserver protos
+)");
+    }
+
+private:
+    proto::Decoder decoder_;
+};
+
 }  // namespace yapi
 
 int main(int argc, char* argv[]) {
     auto list = userver::components::MinimalServerComponentList()
+                    .Append<userver::components::Secdist>()
+                    .Append<userver::components::DefaultSecdistProvider>()
                     .Append<userver::ydb::YdbComponent>()
                     .Append<yapi::Store>()
                     .Append<yapi::Watch>()
-                    .Append<yapi::Bootstrap>();
+                    .Append<yapi::Bootstrap>()
+                    .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.
     for (const char* name : {"api-0", "api-1", "api-2", "api-3", "api-4", "api-5", "api-6", "api-7", "api-8",
                              "apis-0", "apis-1", "apis-2", "apis-3", "apis-4", "apis-5", "apis-6", "apis-7", "apis-8",

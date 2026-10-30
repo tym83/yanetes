@@ -21,6 +21,7 @@
 
 #include <objects.hpp>
 #include <patch.hpp>
+#include <proto.hpp>
 #include <selectors.hpp>
 #include <status.hpp>
 #include <store.hpp>
@@ -163,6 +164,11 @@ Value Bookmark(const Resource& r, std::uint64_t rv, bool initial_end) {
 
 Value ParseBody(const std::string& body) {
     if (body.empty()) return Value();
+    if (proto::Decoder::IsProtobuf(body)) {
+        const auto* decoder = proto::Decoder::Instance();
+        if (!decoder) throw ApiError(415, "UnsupportedMediaType", "this server is not set up for protobuf");
+        return decoder->Decode(body);
+    }
     try {
         return json::FromString(body);
     } catch (const std::exception& e) {

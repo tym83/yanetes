@@ -21,33 +21,34 @@ using userver::storages::Query;
 
 namespace {
 
+// `resource` is a keyword in YQL, so the column is `res`.
 const Query kSchema{R"(
 CREATE TABLE IF NOT EXISTS objects (
-    resource Utf8, ns Utf8, name Utf8, rv Uint64, value String,
-    PRIMARY KEY (resource, ns, name)
+    res Utf8, ns Utf8, name Utf8, rv Uint64, value String,
+    PRIMARY KEY (res, ns, name)
 );
 CREATE TABLE IF NOT EXISTS revisions (
-    resource Utf8, rv Uint64,
-    PRIMARY KEY (resource)
+    res Utf8, rv Uint64,
+    PRIMARY KEY (res)
 );
 CREATE TABLE IF NOT EXISTS events (
-    resource Utf8, rv Uint64, type Utf8, ns Utf8, value String,
-    PRIMARY KEY (resource, rv)
+    res Utf8, rv Uint64, type Utf8, ns Utf8, value String,
+    PRIMARY KEY (res, rv)
 );
 )"};
 
 const Query kGet{
     R"(
 DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
-SELECT value FROM objects WHERE resource = $resource AND ns = $ns AND name = $name;
+SELECT value FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
 )",
     Query::Name{"get"}};
 
 const Query kReadForWrite{
     R"(
 DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
-SELECT rv FROM revisions WHERE resource = $resource;
-SELECT value FROM objects WHERE resource = $resource AND ns = $ns AND name = $name;
+SELECT rv FROM revisions WHERE res = $resource;
+SELECT value FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
 )",
     Query::Name{"read-for-write"}};
 
@@ -55,9 +56,9 @@ const Query kPut{
     R"(
 DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
 DECLARE $rv AS Uint64; DECLARE $value AS String; DECLARE $type AS Utf8;
-UPSERT INTO revisions (resource, rv) VALUES ($resource, $rv);
-UPSERT INTO objects (resource, ns, name, rv, value) VALUES ($resource, $ns, $name, $rv, $value);
-UPSERT INTO events (resource, rv, type, ns, value) VALUES ($resource, $rv, $type, $ns, $value);
+UPSERT INTO revisions (res, rv) VALUES ($resource, $rv);
+UPSERT INTO objects (res, ns, name, rv, value) VALUES ($resource, $ns, $name, $rv, $value);
+UPSERT INTO events (res, rv, type, ns, value) VALUES ($resource, $rv, $type, $ns, $value);
 )",
     Query::Name{"put"}};
 
@@ -65,18 +66,18 @@ const Query kRemove{
     R"(
 DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $name AS Utf8;
 DECLARE $rv AS Uint64; DECLARE $value AS String;
-UPSERT INTO revisions (resource, rv) VALUES ($resource, $rv);
-DELETE FROM objects WHERE resource = $resource AND ns = $ns AND name = $name;
-UPSERT INTO events (resource, rv, type, ns, value) VALUES ($resource, $rv, "DELETED"u, $ns, $value);
+UPSERT INTO revisions (res, rv) VALUES ($resource, $rv);
+DELETE FROM objects WHERE res = $resource AND ns = $ns AND name = $name;
+UPSERT INTO events (res, rv, type, ns, value) VALUES ($resource, $rv, "DELETED"u, $ns, $value);
 )",
     Query::Name{"remove"}};
 
 const Query kListAll{
     R"(
 DECLARE $resource AS Utf8; DECLARE $after_ns AS Utf8; DECLARE $after_name AS Utf8; DECLARE $limit AS Uint64;
-SELECT rv FROM revisions WHERE resource = $resource;
+SELECT rv FROM revisions WHERE res = $resource;
 SELECT ns, name, value FROM objects
-WHERE resource = $resource AND (ns > $after_ns OR (ns = $after_ns AND name > $after_name))
+WHERE res = $resource AND (ns > $after_ns OR (ns = $after_ns AND name > $after_name))
 ORDER BY ns, name LIMIT $limit;
 )",
     Query::Name{"list-all"}};
@@ -84,9 +85,9 @@ ORDER BY ns, name LIMIT $limit;
 const Query kListNs{
     R"(
 DECLARE $resource AS Utf8; DECLARE $ns AS Utf8; DECLARE $after_name AS Utf8; DECLARE $limit AS Uint64;
-SELECT rv FROM revisions WHERE resource = $resource;
+SELECT rv FROM revisions WHERE res = $resource;
 SELECT ns, name, value FROM objects
-WHERE resource = $resource AND ns = $ns AND name > $after_name
+WHERE res = $resource AND ns = $ns AND name > $after_name
 ORDER BY ns, name LIMIT $limit;
 )",
     Query::Name{"list-ns"}};
@@ -94,21 +95,21 @@ ORDER BY ns, name LIMIT $limit;
 const Query kRevision{
     R"(
 DECLARE $resource AS Utf8;
-SELECT rv FROM revisions WHERE resource = $resource;
+SELECT rv FROM revisions WHERE res = $resource;
 )",
     Query::Name{"revision"}};
 
 const Query kEventsAfter{
     R"(
 DECLARE $resource AS Utf8; DECLARE $rv AS Uint64; DECLARE $limit AS Uint64;
-SELECT rv, type, ns, value FROM events WHERE resource = $resource AND rv > $rv ORDER BY rv LIMIT $limit;
+SELECT rv, type, ns, value FROM events WHERE res = $resource AND rv > $rv ORDER BY rv LIMIT $limit;
 )",
     Query::Name{"events-after"}};
 
 const Query kOldestEvent{
     R"(
 DECLARE $resource AS Utf8;
-SELECT rv FROM events WHERE resource = $resource ORDER BY rv LIMIT 1;
+SELECT rv FROM events WHERE res = $resource ORDER BY rv LIMIT 1;
 )",
     Query::Name{"oldest-event"}};
 

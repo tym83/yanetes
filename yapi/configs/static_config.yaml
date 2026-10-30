@@ -33,11 +33,17 @@ components_manager:
         dynamic-config:
             defaults: {}
 
+        # YDB asks for secrets; ours runs without any.
+        secdist: {}
+        default-secdist-provider:
+            config: /dev/null
+            missing-ok: true
+
         ydb:
             databases:
                 main:
                     endpoint: $ydb-endpoint
-                    endpoint#fallback: grpc://ydb:2136
+                    endpoint#fallback: ydb:2136
                     database: $ydb-database
                     database#fallback: /local
 
@@ -46,13 +52,16 @@ components_manager:
 
         yapi-watch: {}
         yapi-bootstrap: {}
+        yapi-protobuf:
+            proto-dir: $proto-dir
+            proto-dir#fallback: /usr/share/yapi/proto
 
         # One handler per path depth; they all are the same API.
         api-0:
             path: '/api'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -60,7 +69,7 @@ components_manager:
             path: '/api/{1}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -68,7 +77,7 @@ components_manager:
             path: '/api/{1}/{2}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -76,7 +85,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -84,7 +93,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}/{4}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -92,7 +101,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}/{4}/{5}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -100,7 +109,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}/{4}/{5}/{6}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -108,7 +117,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}/{4}/{5}/{6}/{7}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -116,7 +125,7 @@ components_manager:
             path: '/api/{1}/{2}/{3}/{4}/{5}/{6}/{7}/{8}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -124,7 +133,7 @@ components_manager:
             path: '/apis'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -132,7 +141,7 @@ components_manager:
             path: '/apis/{1}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -140,7 +149,7 @@ components_manager:
             path: '/apis/{1}/{2}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -148,7 +157,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -156,7 +165,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}/{4}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -164,7 +173,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}/{4}/{5}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -172,7 +181,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -180,7 +189,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}/{7}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -188,7 +197,7 @@ components_manager:
             path: '/apis/{1}/{2}/{3}/{4}/{5}/{6}/{7}/{8}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -196,7 +205,7 @@ components_manager:
             path: '/{1}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -204,7 +213,7 @@ components_manager:
             path: '/openapi/{1}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -212,7 +221,7 @@ components_manager:
             path: '/openapi/{1}/{2}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -220,7 +229,7 @@ components_manager:
             path: '/openapi/{1}/{2}/{3}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
@@ -228,7 +237,7 @@ components_manager:
             path: '/openapi/{1}/{2}/{3}/{4}'
             method: GET,POST,PUT,PATCH,DELETE
             task_processor: main-task-processor
-            response_body_stream: true
+            response-body-stream: true
             tokens-file: $tokens-file
             openapi-dir: $openapi-dir
             openapi-dir#fallback: ''
