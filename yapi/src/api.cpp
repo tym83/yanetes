@@ -1901,7 +1901,8 @@ void Api::HandleStreamRequest(
                     shown.erase(key);
                 }
             }
-            const bool was = shown.count(key) > 0;
+            // A creation is new to every watch, whatever came before it.
+            const bool was = type != "ADDED" && shown.count(key) > 0;
             if (type == "DELETED") {
                 if (was || now) send(Event("DELETED", object));
                 shown.erase(key);
