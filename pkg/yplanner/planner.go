@@ -192,6 +192,20 @@ func (p *Planner) schedule(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
+	// Room promised to pods that preempted for it is taken, unless they
+	// matter less than this one: without that, the pods just evicted come
+	// back in their place before the preemptor does.
+	if pending, err := p.pods.List(labels.Everything()); err == nil {
+		for _, other := range pending {
+			if other.UID == pod.UID || other.Spec.NodeName != "" || other.Status.NominatedNodeName == "" ||
+				corev1helpers.PodPriority(other) < corev1helpers.PodPriority(pod) {
+				continue
+			}
+			if s := state[other.Status.NominatedNodeName]; s != nil {
+				s.add(other)
+			}
+		}
+	}
 	fits, reasons := p.filter(pod, state)
 	if len(fits) == 0 {
 		p.unschedulable(ctx, pod, len(nodes), reasons)

@@ -87,6 +87,9 @@ components_manager:
             client-ca-file#fallback: ''
             requestheader-client-ca-file: $requestheader-client-ca-file
             requestheader-client-ca-file#fallback: ''
+        yapi-rbac:
+            bootstrap-dir: $rbac-dir
+            bootstrap-dir#fallback: ''
         yapi-policies: {}
         yapi-protobuf:
             proto-dir: $proto-dir

@@ -1,0 +1,66 @@
+# What the cluster's own add-ons need beyond upstream's defaults: flannel
+# runs as the kube-proxy user, CoreDNS as kube-system/coredns. The rules are
+# those of the flannel manifest and of kubeadm's CoreDNS add-on.
+apiVersion: v1
+kind: List
+items:
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: yandexnetes:flannel
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+  rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [nodes/status]
+    verbs: [patch]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: yandexnetes:flannel
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: yandexnetes:flannel
+  subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: system:kube-proxy
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRole
+  metadata:
+    name: system:coredns
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+  rules:
+  - apiGroups: [""]
+    resources: [endpoints, services, pods, namespaces]
+    verbs: [list, watch]
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [list, watch]
+- apiVersion: rbac.authorization.k8s.io/v1
+  kind: ClusterRoleBinding
+  metadata:
+    name: system:coredns
+    annotations:
+      rbac.authorization.kubernetes.io/autoupdate: "true"
+  roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: system:coredns
+  subjects:
+  - kind: ServiceAccount
+    name: coredns
+    namespace: kube-system

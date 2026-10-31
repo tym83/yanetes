@@ -13,6 +13,7 @@
 
 #include <aggregator.hpp>
 #include <api.hpp>
+#include <rbac.hpp>
 #include <auth.hpp>
 #include <crds.hpp>
 #include <policies.hpp>
@@ -105,6 +106,7 @@ int main(int argc, char* argv[]) {
                     .AppendComponentList(userver::clients::http::ComponentList())
                     .Append<yapi::Webhooks>()
                     .Append<yapi::Aggregator>()
+                    .Append<yapi::Rbac>()
                     .Append<yapi::Policies>()
                     .Append<yapi::Protobuf>();
     // userver matches whole path segments, so the API is registered once per depth.

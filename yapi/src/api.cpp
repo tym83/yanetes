@@ -36,6 +36,7 @@
 #include <objects.hpp>
 #include <openapi.hpp>
 #include <patch.hpp>
+#include <rbac.hpp>
 #include <proto.hpp>
 #include <schema.hpp>
 #include <selectors.hpp>
@@ -320,6 +321,50 @@ Value AggregatedDiscovery(const Registry& reg, bool core) {
     return doc.ExtractValue();
 }
 
+// What a request asks to do, worked out from its path as upstream's
+// RequestInfoFactory does.
+Attributes RequestAttributes(const http::HttpRequest& request, const std::vector<std::string>& parts) {
+    Attributes a;
+    std::string method = request.GetMethodStr();
+    for (auto& c : method) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    const bool api = !parts.empty() && parts[0] == "api";
+    const bool apis = !parts.empty() && parts[0] == "apis";
+    const std::size_t base = api ? 2 : 3;
+    if ((!api && !apis) || parts.size() <= base) {
+        a.resource_request = false;
+        a.path = request.GetRequestPath();
+        a.verb = method == "head" ? "get" : method;
+        return a;
+    }
+    a.group = api ? "" : parts[1];
+    std::vector<std::string> rest(parts.begin() + base, parts.end());
+    if (rest.size() >= 3 && rest[0] == "namespaces") {
+        a.ns = rest[1];
+        rest.erase(rest.begin(), rest.begin() + 2);
+    } else if (rest[0] == "namespaces" && rest.size() >= 2) {
+        a.ns = rest[1];  // a namespace is in itself
+    }
+    a.resource = rest[0];
+    if (rest.size() >= 2) a.name = rest[1];
+    if (rest.size() >= 3) a.subresource = rest[2];
+    const auto watch_arg = request.GetArg("watch");
+    const bool watch = watch_arg == "true" || watch_arg == "1";
+    if (method == "get" || method == "head") {
+        a.verb = watch ? "watch" : a.name.empty() ? "list" : "get";
+    } else if (method == "post") {
+        a.verb = "create";
+    } else if (method == "put") {
+        a.verb = "update";
+    } else if (method == "patch") {
+        a.verb = "patch";
+    } else if (method == "delete") {
+        a.verb = a.name.empty() ? "deletecollection" : "delete";
+    } else {
+        a.verb = method;
+    }
+    return a;
+}
+
 bool WantsAggregated(const http::HttpRequest& request) {
     return request.GetHeader("Accept").find("as=APIGroupDiscoveryList") != std::string::npos;
 }
@@ -493,6 +538,7 @@ Api::Api(const userver::components::ComponentConfig& config, const userver::comp
       webhooks_(context.FindComponent<Webhooks>()),
       policies_(context.FindComponent<Policies>()),
       aggregator_(context.FindComponent<Aggregator>()),
+      rbac_(context.FindComponent<Rbac>()),
       http_(context.FindComponent<userver::components::HttpClient>().GetHttpClient()),
       registry_(Registry::Builtin()),
       openapi_dir_(config["openapi-dir"].As<std::string>("")) {}
@@ -544,6 +590,10 @@ std::string Api::Handle(const http::HttpRequest& request) const {
         policies_.Refresh();
     }
     if (method != http::HttpMethod::kGet && method != http::HttpMethod::kHead &&
+        request.GetRequestPath().find("/apis/rbac.authorization.k8s.io/") == 0) {
+        rbac_.Refresh();
+    }
+    if (method != http::HttpMethod::kGet && method != http::HttpMethod::kHead &&
         request.GetRequestPath().find("/apis/apiregistration.k8s.io/") == 0) {
         aggregator_.Kick();
     }
@@ -569,6 +619,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
     }
     const auto user = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
     if (!user) throw Unauthorized();
+    Authorize(*user, RequestAttributes(request, parts));
 
     if (parts.size() == 2 && parts[0] == ".well-known" && parts[1] == "openid-configuration") {
         return auth_.OpenIdConfiguration();
@@ -1392,6 +1443,19 @@ std::vector<Value> Api::RemoteGroups() const {
     return out;
 }
 
+void Api::Authorize(const User& user, const Attributes& a) const {
+    if (rbac_.Authorize(user, a).allowed) return;
+    // Said as upstream says it.
+    const auto who = "User " + std::string("\"") + user.name + "\" cannot " + a.verb;
+    if (!a.resource_request) throw ApiError(403, "Forbidden", "forbidden: " + who + " path \"" + a.path + "\"");
+    const auto resource = a.subresource.empty() ? a.resource : a.resource + "/" + a.subresource;
+    const auto scope = a.ns.empty() ? std::string(" at the cluster scope") : " in the namespace \"" + a.ns + "\"";
+    const auto what = a.name.empty() ? a.resource : a.resource + (a.group.empty() ? "" : "." + a.group) + " \"" + a.name + "\"";
+    const auto subject = a.name.empty() ? (a.group.empty() ? a.resource : a.resource + "." + a.group) : what;
+    throw ApiError(403, "Forbidden", subject + " is forbidden: " + who + " resource \"" + resource + "\" in API group \"" + a.group + "\"" + scope)
+        .About(a.resource, a.group, a.name);
+}
+
 bool Api::FieldsMatch(const Resource& r, const FieldSelector& fields, const Value& stored) const {
     // Selectable fields of a custom resource are paths of the version asked
     // for, so the object is matched as that version shows it.
@@ -1683,22 +1747,39 @@ std::string Api::Review(const Resource& r, const http::HttpRequest& request, con
         return json::ToString(out.ExtractValue());
     }
     if (r.plural == "selfsubjectrulesreviews") {
-        ValueBuilder rule(json::Type::kObject);
-        rule["verbs"] = std::vector<std::string>{"*"};
-        rule["apiGroups"] = std::vector<std::string>{"*"};
-        rule["resources"] = std::vector<std::string>{"*"};
-        ValueBuilder url(json::Type::kObject);
-        url["verbs"] = std::vector<std::string>{"*"};
-        url["nonResourceURLs"] = std::vector<std::string>{"*"};
-        out["status"]["resourceRules"] = std::vector<Value>{rule.ExtractValue()};
-        out["status"]["nonResourceRules"] = std::vector<Value>{url.ExtractValue()};
+        const auto rules = rbac_.RulesFor(user, body["spec"]["namespace"].As<std::string>(""));
+        out["status"]["resourceRules"] = rules.resource;
+        out["status"]["nonResourceRules"] = rules.non_resource;
         out["status"]["incomplete"] = false;
         return json::ToString(out.ExtractValue());
     }
-    // Access reviews: every authenticated user may do everything until the
-    // RBAC authorizer lands.
-    out["status"]["allowed"] = true;
-    out["status"]["reason"] = "yapi authorizes every authenticated request";
+    // Access reviews: the asker's own, or of the user the spec names.
+    const auto spec = body["spec"];
+    User subject = user;
+    if (r.plural == "subjectaccessreviews" || r.plural == "localsubjectaccessreviews") {
+        subject = User{};
+        subject.name = spec["user"].As<std::string>("");
+        subject.uid = spec["uid"].As<std::string>("");
+        for (const auto& g : objects::Items(spec["groups"])) subject.groups.push_back(g.As<std::string>(""));
+    }
+    Attributes attrs;
+    if (spec["nonResourceAttributes"].IsObject()) {
+        attrs.resource_request = false;
+        attrs.path = spec["nonResourceAttributes"]["path"].As<std::string>("");
+        attrs.verb = spec["nonResourceAttributes"]["verb"].As<std::string>("");
+    } else {
+        const auto ra = spec["resourceAttributes"];
+        attrs.verb = ra["verb"].As<std::string>("");
+        attrs.group = ra["group"].As<std::string>("");
+        attrs.resource = ra["resource"].As<std::string>("");
+        attrs.subresource = ra["subresource"].As<std::string>("");
+        attrs.name = ra["name"].As<std::string>("");
+        attrs.ns = ra["namespace"].As<std::string>("");
+        if (r.plural == "localsubjectaccessreviews" && !objects::Namespace(body).empty()) attrs.ns = objects::Namespace(body);
+    }
+    const auto decision = rbac_.Authorize(subject, attrs);
+    out["status"]["allowed"] = decision.allowed;
+    if (!decision.reason.empty()) out["status"]["reason"] = decision.reason;
     return json::ToString(out.ExtractValue());
 }
 
@@ -1770,8 +1851,10 @@ void Api::HandleStreamRequest(
         stream.PushBodyChunk(json::ToString(e.ToStatus()), userver::engine::Deadline::FromDuration(std::chrono::seconds(5)));
     };
     try {
-        if (!auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization))) return fail(Unauthorized());
+        const auto user = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
+        if (!user) return fail(Unauthorized());
         auto parts = Split(request.GetRequestPath());
+        Authorize(*user, RequestAttributes(request, parts));
         if (Flag(request, "follow") && parts.size() == 7 && parts[0] == "api" && parts[2] == "namespaces" && parts[4] == "pods" && parts[6] == "log") {
             // kubectl logs -f: the kubelet's chunks go on as they come.
             auto [conn, target] = KubeletTarget(request, parts[3], parts[5], "log");

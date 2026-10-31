@@ -23,6 +23,8 @@ class Auth;
 class Crds;
 class Webhooks;
 class Aggregator;
+class Rbac;
+struct Attributes;
 class Policies;
 class Services;
 class Store;
@@ -68,6 +70,7 @@ private:
     // Custom resources: the object as the client's version shows it, and as stored.
     userver::formats::json::Value ToView(const Resource& r, const userver::formats::json::Value& object) const;
     std::vector<userver::formats::json::Value> RemoteGroups() const;
+    void Authorize(const User& user, const Attributes& attrs) const;  // throws 403
     bool FieldsMatch(const Resource& r, const FieldSelector& fields, const userver::formats::json::Value& stored) const;
     userver::formats::json::Value ToStorage(const Resource& r, const userver::formats::json::Value& object) const;
     // Prunes and checks fields as the request's fieldValidation asks.
@@ -86,6 +89,7 @@ private:
     Webhooks& webhooks_;
     Policies& policies_;
     const Aggregator& aggregator_;
+    Rbac& rbac_;
     userver::clients::http::Client& http_;
     const Registry& registry_;
     std::string openapi_dir_;

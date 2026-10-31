@@ -33,7 +33,7 @@ b cxx "set -e; o=/work/out/cp; mkdir -p \$o/bin \$o/lib \$o/etc
   strip -o \$o/bin/yapi /work/build/yapi/yapi
   ldd /work/build/yapi/yapi | awk '/=> \\//{print \$3}' | grep -v -E 'libc.so|libm.so|libpthread|libdl.so|librt.so|libresolv' | xargs -I{} cp -L {} \$o/lib/
   cp /work/src/yapi/configs/static_config.yaml \$o/etc/
-  cp -r /work/proto /work/openapi \$o/"
+  cp -r /work/proto /work/openapi \$o/; mkdir -p \$o/rbac && cp /work/src/yapi/bootstrap/rbac/*.yaml \$o/rbac/"
 b go "cp /work/bin/nanny /work/bin/yplanner /work/out/cp/bin/"
 # Each release unpacks into a directory of its own and "current" moves to
 # it at once: files rewritten in place under a running process crash it
@@ -83,6 +83,7 @@ tls-key: /etc/yandexnetes/cp/pki/tls.key
 tokens-file: /etc/yandexnetes/cp/tokens.csv
 openapi-dir: /opt/yandexnetes/current/openapi
 proto-dir: /opt/yandexnetes/current/proto
+rbac-dir: /opt/yandexnetes/current/rbac
 ydb-endpoint: ydb.$NS.svc.cozy.local:2136
 ydb-database: /local
 worker-threads: 4
