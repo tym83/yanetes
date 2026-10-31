@@ -35,69 +35,97 @@ func termMatches(term corev1.PodAffinityTerm, owner, pod *corev1.Pod) bool {
 	return sel.Matches(labels.Set(pod.Labels))
 }
 
-// interPodAffinity checks the required pod affinity and anti-affinity of
-// the pod, and the anti-affinity of the pods already placed against it.
-func interPodAffinity(pod *corev1.Pod, s *nodeState, all map[string]*nodeState) string {
-	value := func(n *corev1.Node, key string) (string, bool) {
-		v, ok := n.Labels[key]
-		return v, ok
+// affinityIndex holds what the inter-pod affinity checks of one pod need
+// from the whole cluster, gathered once per scheduling attempt: checking
+// a node is then a lookup, not a walk over every pod on every node.
+type affinityIndex struct {
+	affinity []termIndex // the pod's required affinity terms
+	anti     []termIndex // the pod's required anti-affinity terms
+	// Placed pods with required anti-affinity of their own: few, usually none.
+	antiPods []placedPod
+}
+
+// termIndex is where the pods a term points at are: the values of its
+// topology key on their nodes.
+type termIndex struct {
+	term     corev1.PodAffinityTerm
+	values   map[string]bool
+	anywhere bool
+}
+
+type placedPod struct {
+	pod  *corev1.Pod
+	node *corev1.Node
+}
+
+func buildAffinityIndex(pod *corev1.Pod, state map[string]*nodeState) *affinityIndex {
+	idx := &affinityIndex{}
+	index := func(terms []corev1.PodAffinityTerm) []termIndex {
+		out := make([]termIndex, 0, len(terms))
+		for _, term := range terms {
+			out = append(out, termIndex{term: term, values: map[string]bool{}})
+		}
+		return out
 	}
 	if a := pod.Spec.Affinity; a != nil && a.PodAffinity != nil {
-		for _, term := range a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			here, ok := value(s.node, term.TopologyKey)
-			if !ok {
-				return "node(s) didn't match pod affinity rules"
-			}
-			found, anywhere := false, false
-			for _, other := range all {
-				for _, p := range other.pods {
-					if !termMatches(term, pod, p) {
-						continue
-					}
-					anywhere = true
-					if v, ok := value(other.node, term.TopologyKey); ok && v == here {
-						found = true
-					}
-				}
-			}
-			// The first pod of a group that wants to be together may go anywhere.
-			if !found && !(!anywhere && termMatches(term, pod, pod)) {
-				return "node(s) didn't match pod affinity rules"
-			}
-		}
+		idx.affinity = index(a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
 	}
 	if a := pod.Spec.Affinity; a != nil && a.PodAntiAffinity != nil {
-		for _, term := range a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-			here, ok := value(s.node, term.TopologyKey)
-			if !ok {
-				continue
-			}
-			for _, other := range all {
-				if v, ok := value(other.node, term.TopologyKey); !ok || v != here {
-					continue
-				}
-				for _, p := range other.pods {
-					if termMatches(term, pod, p) {
-						return "node(s) didn't match pod anti-affinity rules"
+		idx.anti = index(a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution)
+	}
+	for _, s := range state {
+		for _, p := range s.pods {
+			for i := range idx.affinity {
+				t := &idx.affinity[i]
+				if termMatches(t.term, pod, p) {
+					t.anywhere = true
+					if v, ok := s.node.Labels[t.term.TopologyKey]; ok {
+						t.values[v] = true
 					}
 				}
 			}
+			for i := range idx.anti {
+				t := &idx.anti[i]
+				if termMatches(t.term, pod, p) {
+					if v, ok := s.node.Labels[t.term.TopologyKey]; ok {
+						t.values[v] = true
+					}
+				}
+			}
+			if a := p.Spec.Affinity; a != nil && a.PodAntiAffinity != nil && len(a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+				idx.antiPods = append(idx.antiPods, placedPod{pod: p, node: s.node})
+			}
 		}
 	}
-	for _, other := range all {
-		for _, p := range other.pods {
-			a := p.Spec.Affinity
-			if a == nil || a.PodAntiAffinity == nil {
+	return idx
+}
+
+// interPodAffinity checks the required pod affinity and anti-affinity of
+// the pod, and the anti-affinity of the pods already placed against it.
+func interPodAffinity(pod *corev1.Pod, s *nodeState, idx *affinityIndex) string {
+	for _, t := range idx.affinity {
+		here, ok := s.node.Labels[t.term.TopologyKey]
+		if !ok {
+			return "node(s) didn't match pod affinity rules"
+		}
+		// The first pod of a group that wants to be together may go anywhere.
+		if !t.values[here] && !(!t.anywhere && termMatches(t.term, pod, pod)) {
+			return "node(s) didn't match pod affinity rules"
+		}
+	}
+	for _, t := range idx.anti {
+		if here, ok := s.node.Labels[t.term.TopologyKey]; ok && t.values[here] {
+			return "node(s) didn't match pod anti-affinity rules"
+		}
+	}
+	for _, placed := range idx.antiPods {
+		for _, term := range placed.pod.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			there, ok := placed.node.Labels[term.TopologyKey]
+			if !ok {
 				continue
 			}
-			for _, term := range a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-				there, ok := value(other.node, term.TopologyKey)
-				if !ok {
-					continue
-				}
-				if here, ok := value(s.node, term.TopologyKey); ok && here == there && termMatches(term, p, pod) {
-					return "node(s) didn't satisfy existing pods anti-affinity rules"
-				}
+			if here, ok := s.node.Labels[term.TopologyKey]; ok && here == there && termMatches(term, placed.pod, pod) {
+				return "node(s) didn't satisfy existing pods anti-affinity rules"
 			}
 		}
 	}

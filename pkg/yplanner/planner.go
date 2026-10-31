@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -45,6 +47,11 @@ type Planner struct {
 	assumed map[types.UID]assumedPod
 	// Pods that fit nowhere wait for the cluster to change.
 	waiting map[string]struct{}
+	// Where the next pod starts looking for nodes.
+	nextStart int
+	// Bindings in flight, at most as many as it holds.
+	binding chan struct{}
+	cache   *clusterCache
 }
 
 type assumedPod struct {
@@ -65,14 +72,20 @@ func New(client kubernetes.Interface, factory informers.SharedInformerFactory, n
 		),
 		assumed: map[types.UID]assumedPod{},
 		waiting: map[string]struct{}{},
+		binding: make(chan struct{}, 64),
+		cache:   newClusterCache(),
 	}
 	broadcaster := record.NewBroadcaster()
 	broadcaster.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events("")})
 	p.recorder = broadcaster.NewRecorder(scheme.Scheme, corev1.EventSource{Component: name})
 
 	_, _ = factory.Core().V1().Pods().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) { p.podChanged(obj.(*corev1.Pod)) },
+		AddFunc: func(obj any) {
+			p.cache.update(obj.(*corev1.Pod))
+			p.podChanged(obj.(*corev1.Pod))
+		},
 		UpdateFunc: func(_, obj any) {
+			p.cache.update(obj.(*corev1.Pod))
 			p.podChanged(obj.(*corev1.Pod))
 		},
 		DeleteFunc: func(obj any) {
@@ -80,6 +93,7 @@ func New(client kubernetes.Interface, factory informers.SharedInformerFactory, n
 				obj = t.Obj
 			}
 			if pod, ok := obj.(*corev1.Pod); ok {
+				p.cache.remove(pod.UID)
 				p.forget(pod.UID)
 				if pod.Spec.NodeName != "" {
 					p.wakeWaiting()
@@ -88,8 +102,25 @@ func New(client kubernetes.Interface, factory informers.SharedInformerFactory, n
 		},
 	})
 	_, _ = factory.Core().V1().Nodes().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(any) { p.wakeWaiting() },
-		UpdateFunc: func(any, any) { p.wakeWaiting() },
+		AddFunc: func(obj any) {
+			p.cache.upsertNode(obj.(*corev1.Node))
+			p.wakeWaiting()
+		},
+		UpdateFunc: func(old, obj any) {
+			p.cache.upsertNode(obj.(*corev1.Node))
+			// Heartbeats change nothing a waiting pod cares about.
+			if nodeSchedulingChanged(old.(*corev1.Node), obj.(*corev1.Node)) {
+				p.wakeWaiting()
+			}
+		},
+		DeleteFunc: func(obj any) {
+			if t, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+				obj = t.Obj
+			}
+			if n, ok := obj.(*corev1.Node); ok {
+				p.cache.deleteNode(n.Name)
+			}
+		},
 	})
 	return p
 }
@@ -150,7 +181,7 @@ func (p *Planner) Run(ctx context.Context) {
 			p.queue.Done(key)
 		}
 	}()
-	// Assumed pods the cache never confirmed are let go after a while.
+	// Assumed pods the informer never showed bound are let go after a while.
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
@@ -163,6 +194,9 @@ func (p *Planner) Run(ctx context.Context) {
 				for uid, a := range p.assumed {
 					if time.Since(a.at) > 30*time.Second {
 						delete(p.assumed, uid)
+						if live, err := p.pods.Pods(a.pod.Namespace).Get(a.pod.Name); err != nil || live.UID != uid || live.Spec.NodeName == "" {
+							p.cache.remove(uid)
+						}
 					}
 				}
 				p.mu.Unlock()
@@ -184,17 +218,19 @@ func (p *Planner) schedule(ctx context.Context, key string) error {
 	if pod.Spec.NodeName != "" || pod.DeletionTimestamp != nil || pod.Spec.SchedulerName != p.name {
 		return nil
 	}
-	nodes, err := p.nodes.List(labels.Everything())
-	if err != nil {
-		return err
+	// Placed already, its binding still on the way.
+	p.mu.Lock()
+	_, placed := p.assumed[pod.UID]
+	p.mu.Unlock()
+	if placed {
+		return nil
 	}
-	state, err := p.snapshot(nodes)
-	if err != nil {
-		return err
-	}
+	p.cache.mu.Lock()
+	state, names := p.cache.nodes, p.cache.names
 	// Room promised to pods that preempted for it is taken, unless they
 	// matter less than this one: without that, the pods just evicted come
 	// back in their place before the preemptor does.
+	cloned := false
 	if pending, err := p.pods.List(labels.Everything()); err == nil {
 		for _, other := range pending {
 			if other.UID == pod.UID || other.Spec.NodeName != "" || other.Status.NominatedNodeName == "" ||
@@ -202,14 +238,22 @@ func (p *Planner) schedule(ctx context.Context, key string) error {
 				continue
 			}
 			if s := state[other.Status.NominatedNodeName]; s != nil {
-				s.add(other)
+				if !cloned {
+					state, cloned = maps.Clone(state), true
+				}
+				promised := s.without(nil)
+				promised.add(other)
+				state[other.Status.NominatedNodeName] = promised
 			}
 		}
 	}
-	fits, reasons := p.filter(pod, state)
+	fits, reasons := p.filter(pod, state, names)
 	if len(fits) == 0 {
-		p.unschedulable(ctx, pod, len(nodes), reasons)
+		p.cache.mu.Unlock()
+		p.unschedulable(ctx, pod, len(names), reasons)
+		p.cache.mu.Lock()
 		p.preempt(ctx, pod, state)
+		p.cache.mu.Unlock()
 		p.mu.Lock()
 		p.waiting[key] = struct{}{}
 		p.mu.Unlock()
@@ -220,18 +264,47 @@ func (p *Planner) schedule(ctx context.Context, key string) error {
 		ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name, UID: pod.UID},
 		Target:     corev1.ObjectReference{Kind: "Node", Name: node.node.Name},
 	}
+	// The pod counts as placed from now on.
+	p.cache.placeLocked(pod, node.node.Name)
+	p.cache.mu.Unlock()
 	p.mu.Lock()
 	p.assumed[pod.UID] = assumedPod{pod: pod, node: node.node.Name, at: time.Now()}
 	p.mu.Unlock()
-	if err := p.client.CoreV1().Pods(pod.Namespace).Bind(ctx, binding, metav1.CreateOptions{}); err != nil {
-		p.forget(pod.UID)
-		if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
-			return nil
+	// The pod counts as placed from now on; the binding goes out on its own,
+	// as upstream's binding cycle does, so the next pod need not wait for it.
+	p.binding <- struct{}{}
+	go func() {
+		defer func() { <-p.binding }()
+		if err := p.client.CoreV1().Pods(pod.Namespace).Bind(ctx, binding, metav1.CreateOptions{}); err != nil {
+			p.forget(pod.UID)
+			p.cache.remove(pod.UID)
+			if !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+				slog.Warn("binding failed", "pod", key, "err", err)
+				p.queue.AddRateLimited(key)
+			}
+			return
 		}
-		return err
-	}
-	p.recorder.Eventf(pod, corev1.EventTypeNormal, "Scheduled", "Successfully assigned %s/%s to %s", pod.Namespace, pod.Name, node.node.Name)
+		p.recorder.Eventf(pod, corev1.EventTypeNormal, "Scheduled", "Successfully assigned %s/%s to %s", pod.Namespace, pod.Name, node.node.Name)
+	}()
 	return nil
+}
+
+// nodeSchedulingChanged says whether a node update may let a waiting pod
+// in: anything but heartbeats.
+func nodeSchedulingChanged(old, cur *corev1.Node) bool {
+	if old.Spec.Unschedulable != cur.Spec.Unschedulable || !equality.Semantic.DeepEqual(old.Spec.Taints, cur.Spec.Taints) ||
+		!equality.Semantic.DeepEqual(old.Labels, cur.Labels) || !equality.Semantic.DeepEqual(old.Status.Allocatable, cur.Status.Allocatable) {
+		return true
+	}
+	ready := func(n *corev1.Node) corev1.ConditionStatus {
+		for _, c := range n.Status.Conditions {
+			if c.Type == corev1.NodeReady {
+				return c.Status
+			}
+		}
+		return ""
+	}
+	return ready(old) != ready(cur)
 }
 
 // unschedulable records why, as upstream does: a condition and an event.
@@ -276,7 +349,7 @@ type nodeState struct {
 	node      *corev1.Node
 	requested corev1.ResourceList
 	podCount  int
-	hostPorts map[string]bool
+	hostPorts map[string]int // pods using each host port
 	pods      []*corev1.Pod
 }
 
@@ -287,73 +360,50 @@ func portKey(ip string, proto corev1.Protocol, port int32) string {
 	return fmt.Sprintf("%s/%s/%d", ip, proto, port)
 }
 
-// add counts a pod in on the node.
-func (s *nodeState) add(pod *corev1.Pod) {
-	for name, q := range resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{}) {
-		cur := s.requested[name]
-		cur.Add(q)
-		s.requested[name] = cur
-	}
-	s.podCount++
-	s.pods = append(s.pods, pod)
-	for _, c := range pod.Spec.Containers {
-		for _, port := range c.Ports {
-			if port.HostPort > 0 {
-				s.hostPorts[portKey(port.HostIP, port.Protocol, port.HostPort)] = true
-			}
-		}
-	}
-}
-
-func (p *Planner) snapshot(nodes []*corev1.Node) (map[string]*nodeState, error) {
-	state := make(map[string]*nodeState, len(nodes))
-	for _, n := range nodes {
-		state[n.Name] = &nodeState{node: n, requested: corev1.ResourceList{}, hostPorts: map[string]bool{}}
-	}
-	pods, err := p.pods.List(labels.Everything())
-	if err != nil {
-		return nil, err
-	}
-	add := func(pod *corev1.Pod, node string) {
-		if s := state[node]; s != nil {
-			s.add(pod)
-		}
-	}
-	seen := map[types.UID]bool{}
-	for _, pod := range pods {
-		if pod.Spec.NodeName == "" || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
-			continue
-		}
-		seen[pod.UID] = true
-		add(pod, pod.Spec.NodeName)
-	}
-	p.mu.Lock()
-	for uid, a := range p.assumed {
-		if !seen[uid] {
-			add(a.pod, a.node)
-		}
-	}
-	p.mu.Unlock()
-	return state, nil
-}
-
-func (p *Planner) filter(pod *corev1.Pod, state map[string]*nodeState) ([]*nodeState, map[string]int) {
+// filter finds nodes the pod fits on. Like upstream's scheduler it stops
+// once it has found enough of them on a big cluster, and each pod starts
+// looking where the last one stopped, so all nodes get their turn.
+func (p *Planner) filter(pod *corev1.Pod, state map[string]*nodeState, names []string) ([]*nodeState, map[string]int) {
 	reasons := map[string]int{}
 	required := nodeaffinity.GetRequiredNodeAffinity(pod)
 	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+	idx := buildAffinityIndex(pod, state)
+	enough := feasibleToFind(len(names))
 	var fits []*nodeState
-	for _, s := range state {
-		if why := p.misfit(pod, s, state, required, requests); why != "" {
+	start := 0
+	if len(names) > 0 {
+		start = p.nextStart % len(names)
+	}
+	examined := 0
+	for i := range names {
+		s := state[names[(start+i)%len(names)]]
+		examined++
+		if why := p.misfit(pod, s, required, requests, idx); why != "" {
 			reasons[why]++
 			continue
 		}
 		fits = append(fits, s)
+		if len(fits) >= enough {
+			break
+		}
 	}
+	p.nextStart = start + examined
 	return fits, reasons
 }
 
-func (p *Planner) misfit(pod *corev1.Pod, s *nodeState, all map[string]*nodeState,
-	required nodeaffinity.RequiredNodeAffinity, requests corev1.ResourceList) string {
+// feasibleToFind is how many fitting nodes are enough, as upstream
+// computes it: all of a small cluster, a shrinking share of a big one,
+// never under a hundred nor under five percent.
+func feasibleToFind(nodes int) int {
+	if nodes < 100 {
+		return nodes
+	}
+	percentage := max(50-nodes/125, 5)
+	return max(nodes*percentage/100, 100)
+}
+
+func (p *Planner) misfit(pod *corev1.Pod, s *nodeState,
+	required nodeaffinity.RequiredNodeAffinity, requests corev1.ResourceList, idx *affinityIndex) string {
 	node := s.node
 	tolerations := pod.Spec.Tolerations
 	tolerated := func(key string, effect corev1.TaintEffect) bool {
@@ -403,20 +453,20 @@ func (p *Planner) misfit(pod *corev1.Pod, s *nodeState, all map[string]*nodeStat
 			if port.HostPort <= 0 {
 				continue
 			}
-			if s.hostPorts[portKey(port.HostIP, port.Protocol, port.HostPort)] ||
-				s.hostPorts[portKey("0.0.0.0", port.Protocol, port.HostPort)] ||
+			if s.hostPorts[portKey(port.HostIP, port.Protocol, port.HostPort)] > 0 ||
+				s.hostPorts[portKey("0.0.0.0", port.Protocol, port.HostPort)] > 0 ||
 				(port.HostIP == "" || port.HostIP == "0.0.0.0") && anyPortOn(s.hostPorts, port.Protocol, port.HostPort) {
 				return "node(s) didn't have free ports for the requested pod ports"
 			}
 		}
 	}
-	if why := interPodAffinity(pod, s, all); why != "" {
+	if why := interPodAffinity(pod, s, idx); why != "" {
 		return why
 	}
 	return ""
 }
 
-func anyPortOn(used map[string]bool, proto corev1.Protocol, port int32) bool {
+func anyPortOn(used map[string]int, proto corev1.Protocol, port int32) bool {
 	suffix := fmt.Sprintf("/%s/%d", proto, port)
 	for k := range used {
 		if strings.HasSuffix(k, suffix) {

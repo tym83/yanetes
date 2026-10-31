@@ -42,6 +42,9 @@ func (p *Planner) preempt(ctx context.Context, pod *corev1.Pod, state map[string
 	required := nodeaffinity.GetRequiredNodeAffinity(pod)
 	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
 	priority := corev1helpers.PodPriority(pod)
+	base := buildAffinityIndex(pod, state)
+	// Victims change what affinity sees only when affinity is in play.
+	affinityMatters := len(base.affinity) > 0 || len(base.anti) > 0 || len(base.antiPods) > 0
 	var candidates []candidate
 	for name, s := range state {
 		var lower []*corev1.Pod
@@ -55,9 +58,13 @@ func (p *Planner) preempt(ctx context.Context, pod *corev1.Pod, state map[string
 		}
 		fits := func(gone []*corev1.Pod) bool {
 			reduced := s.without(gone)
-			all := maps.Clone(state)
-			all[name] = reduced
-			return p.misfit(pod, reduced, all, required, requests) == ""
+			idx := base
+			if affinityMatters {
+				all := maps.Clone(state)
+				all[name] = reduced
+				idx = buildAffinityIndex(pod, all)
+			}
+			return p.misfit(pod, reduced, required, requests, idx) == ""
 		}
 		if !fits(lower) {
 			continue
@@ -140,7 +147,7 @@ func (s *nodeState) without(gone []*corev1.Pod) *nodeState {
 	for _, g := range gone {
 		skip[g.UID] = true
 	}
-	out := &nodeState{node: s.node, requested: corev1.ResourceList{}, hostPorts: map[string]bool{}}
+	out := &nodeState{node: s.node, requested: corev1.ResourceList{}, hostPorts: map[string]int{}}
 	for _, pod := range s.pods {
 		if !skip[pod.UID] {
 			out.add(pod)
