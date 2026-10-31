@@ -71,6 +71,7 @@ private:
     userver::formats::json::Value ToView(const Resource& r, const userver::formats::json::Value& object) const;
     std::vector<userver::formats::json::Value> RemoteGroups() const;
     void Authorize(const User& user, const Attributes& attrs) const;  // throws 403
+    User Impersonated(const userver::server::http::HttpRequest& request, const User& real) const;
     bool FieldsMatch(const Resource& r, const FieldSelector& fields, const userver::formats::json::Value& stored) const;
     userver::formats::json::Value ToStorage(const Resource& r, const userver::formats::json::Value& object) const;
     // Prunes and checks fields as the request's fieldValidation asks.

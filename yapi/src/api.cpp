@@ -617,8 +617,9 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
         v["platform"] = "linux/amd64";
         return json::ToString(v.ExtractValue());
     }
-    const auto user = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
-    if (!user) throw Unauthorized();
+    const auto real = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
+    if (!real) throw Unauthorized();
+    const auto user = std::optional<User>(Impersonated(request, *real));
     Authorize(*user, RequestAttributes(request, parts));
 
     if (parts.size() == 2 && parts[0] == ".well-known" && parts[1] == "openid-configuration") {
@@ -1443,6 +1444,74 @@ std::vector<Value> Api::RemoteGroups() const {
     return out;
 }
 
+// The user a request acts as: the one it authenticated as, or the one its
+// Impersonate-* headers name if that one may impersonate them, as
+// upstream's impersonation filter decides.
+User Api::Impersonated(const http::HttpRequest& request, const User& real) const {
+    const auto as = request.GetHeader("Impersonate-User");
+    std::vector<std::string> groups;
+    std::map<std::string, std::vector<std::string>> extra;
+    for (const auto& name : request.GetHeaderNames()) {
+        std::string lower(name);
+        for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (lower == "impersonate-group") {
+            groups.push_back(request.GetHeader(name));
+        } else if (lower.starts_with("impersonate-extra-")) {
+            extra[userver::http::UrlDecode(lower.substr(18))].push_back(request.GetHeader(name));
+        }
+    }
+    const auto uid = request.GetHeader("Impersonate-Uid");
+    if (as.empty()) {
+        if (!groups.empty() || !extra.empty() || !uid.empty()) {
+            throw ApiError(500, "InternalError", "requested impersonation without a user");
+        }
+        return real;
+    }
+    auto check = [&](const std::string& resource, const std::string& name, const std::string& ns, const std::string& group,
+                     const std::string& subresource) {
+        Attributes a;
+        a.verb = "impersonate";
+        a.group = group;
+        a.resource = resource;
+        a.subresource = subresource;
+        a.name = name;
+        a.ns = ns;
+        if (!rbac_.Authorize(real, a).allowed) {
+            const auto what = resource == "serviceaccounts" ? "serviceaccounts \"" + name + "\"" : resource + " \"" + name + "\"";
+            throw ApiError(403, "Forbidden",
+                           what + " is forbidden: User \"" + real.name + "\" cannot impersonate resource \"" + resource + "\" in API group \"" + group +
+                               "\"" + (ns.empty() ? " at the cluster scope" : " in the namespace \"" + ns + "\""));
+        }
+    };
+    User user;
+    user.name = as;
+    static const std::string kSa = "system:serviceaccount:";
+    if (as.starts_with(kSa) && std::count(as.begin(), as.end(), ':') == 3) {
+        const auto rest = as.substr(kSa.size());
+        const auto ns = rest.substr(0, rest.find(':'));
+        check("serviceaccounts", rest.substr(rest.find(':') + 1), ns, "", "");
+        user.groups = {"system:serviceaccounts", "system:serviceaccounts:" + ns};
+    } else {
+        check("users", as, "", "", "");
+    }
+    for (const auto& g : groups) {
+        check("groups", g, "", "", "");
+        if (std::find(user.groups.begin(), user.groups.end(), g) == user.groups.end()) user.groups.push_back(g);
+    }
+    if (!uid.empty()) {
+        check("uids", uid, "", "authentication.k8s.io", "");
+        user.uid = uid;
+    }
+    for (const auto& [key, values] : extra) {
+        for (const auto& v : values) check("userextras", v, "", "authentication.k8s.io", key);
+    }
+    user.extra = extra;
+    if (as != "system:anonymous" && std::find(user.groups.begin(), user.groups.end(), "system:authenticated") == user.groups.end()) {
+        user.groups.push_back("system:authenticated");
+    }
+    return user;
+}
+
 void Api::Authorize(const User& user, const Attributes& a) const {
     if (rbac_.Authorize(user, a).allowed) return;
     // Said as upstream says it.
@@ -1851,10 +1920,11 @@ void Api::HandleStreamRequest(
         stream.PushBodyChunk(json::ToString(e.ToStatus()), userver::engine::Deadline::FromDuration(std::chrono::seconds(5)));
     };
     try {
-        const auto user = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
-        if (!user) return fail(Unauthorized());
+        const auto real = auth_.Authenticate(request.GetHeader(userver::http::headers::kAuthorization));
+        if (!real) return fail(Unauthorized());
         auto parts = Split(request.GetRequestPath());
-        Authorize(*user, RequestAttributes(request, parts));
+        const auto user = Impersonated(request, *real);
+        Authorize(user, RequestAttributes(request, parts));
         if (Flag(request, "follow") && parts.size() == 7 && parts[0] == "api" && parts[2] == "namespaces" && parts[4] == "pods" && parts[6] == "log") {
             // kubectl logs -f: the kubelet's chunks go on as they come.
             auto [conn, target] = KubeletTarget(request, parts[3], parts[5], "log");
