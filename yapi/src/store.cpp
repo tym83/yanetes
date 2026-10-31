@@ -172,6 +172,7 @@ const Query kCompact{
 DECLARE $resource AS Utf8; DECLARE $rv AS Uint64;
 DELETE FROM events WHERE res = $resource AND rv <= $rv;
 UPSERT INTO compactions (res, rv) VALUES ($resource, $rv);
+UPDATE revisions SET rv = rv + 1 WHERE res = $resource AND rv = $rv;
 )",
     Query::Name{"compact"}};
 
@@ -217,7 +218,9 @@ Store::Store(const userver::components::ComponentConfig& config, const userver::
     EnsureSchema();
     // Compaction, as etcd does it: what was the newest revision one round
     // ago goes from the event log now. Watches and continue tokens older
-    // than that get 410 and start over.
+    // than that get 410 and start over. A resource nobody wrote to since
+    // moves on by one: etcd's revision is global and always newer than
+    // what it compacted, and clients told to start over expect a new one.
     tasks_.AsyncDetach("compact", [this] {
         std::map<std::string, std::uint64_t> previous;
         while (!userver::engine::current_task::ShouldCancel()) {
