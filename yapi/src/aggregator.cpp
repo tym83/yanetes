@@ -21,6 +21,7 @@
 
 #include <objects.hpp>
 #include <registry.hpp>
+#include <routing.hpp>
 #include <status.hpp>
 #include <store.hpp>
 
@@ -150,13 +151,11 @@ std::shared_ptr<userver::clients::http::Response> Aggregator::Send(
     const auto ns = svc["namespace"].As<std::string>("");
     const auto name = svc["name"].As<std::string>("");
     const auto port = svc["port"].As<int>(443);
-    auto service = store_.Get(Kind("", "services"), ns, name);
-    if (!service) throw ApiError(503, "ServiceUnavailable", "service \"" + ns + "/" + name + "\" not found");
-    const auto ip = (*service)["spec"]["clusterIP"].As<std::string>("");
-    // The certificate names the service; the connection goes to its address.
+    const auto to = ServiceDestination(store_, ns, name, port);
+    // The certificate names the service; the connection goes to an endpoint.
     const auto host = name + "." + ns + ".svc";
     namespace client = userver::clients::http;
-    const client::ConnectTo connect_to(host + ":" + std::to_string(port) + ":" + ip + ":" + std::to_string(port));
+    const client::ConnectTo connect_to(host + ":" + std::to_string(port) + ":" + to.ip + ":" + std::to_string(to.port));
     auto out = http_.CreateRequest();
     out.method(client::HttpMethodFromString(method))
         .url("https://" + host + ":" + std::to_string(port) + path_and_query)

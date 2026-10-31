@@ -20,6 +20,7 @@
 #include <cel.hpp>
 #include <objects.hpp>
 #include <patch.hpp>
+#include <routing.hpp>
 #include <status.hpp>
 #include <store.hpp>
 #include <watch.hpp>
@@ -259,11 +260,9 @@ Value Webhooks::Call(const Value& cc, const std::string& name, const Value& body
         auto host = svc_name + "." + svc_ns + ".svc";
         url = "https://" + host + ":" + std::to_string(port) + svc["path"].As<std::string>("");
         // The cluster's DNS is not the control plane's: the name is for TLS,
-        // the connection goes to the service's cluster IP.
-        auto service = store_.Get(*Registry::Builtin().Find("", "v1", "services"), svc_ns, svc_name);
-        if (!service) throw std::runtime_error("service \"" + svc_ns + "/" + svc_name + "\" not found");
-        auto ip = (*service)["spec"]["clusterIP"].As<std::string>("");
-        connect_to.emplace(host + ":" + std::to_string(port) + ":" + ip + ":" + std::to_string(port));
+        // the connection goes to an endpoint of the service.
+        const auto to = ServiceDestination(store_, svc_ns, svc_name, port);
+        connect_to.emplace(host + ":" + std::to_string(port) + ":" + to.ip + ":" + std::to_string(to.port));
     }
     auto request = http_.CreateRequest();
     request.post(url, json::ToString(body))
