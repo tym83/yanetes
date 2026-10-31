@@ -119,7 +119,8 @@ func (r *revisions) ensure(ctx context.Context, owner metav1.Object, kind schema
 		next = existing[n-1].Revision + 1
 	}
 	for _, rev := range existing {
-		if !sameData(rev.Data.Raw, data) {
+		// One being deleted is no revision to come back to.
+		if rev.DeletionTimestamp != nil || !sameData(rev.Data.Raw, data) {
 			continue
 		}
 		if rev.Revision == next-1 {

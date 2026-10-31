@@ -1065,7 +1065,16 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             if (spec_part == nullptr && !finalize) incoming = CheckFields(r, incoming, parsed, request);
             if (!current) {
                 if ((is_patch && !apply) || status_write || finalize) throw NotFound(r.plural, r.group, t.name);
-                // An update of a missing object creates it, as upstream does for most kinds.
+                // An update of a missing object creates it only for the
+                // kinds whose upstream strategy allows that; the others are
+                // gone, and a controller updating a stale copy must hear so.
+                static const std::set<std::string> kCreateOnUpdate = {
+                    "leases.coordination.k8s.io", "leasecandidates.coordination.k8s.io", "endpoints", "events",
+                    "events.events.k8s.io", "limitranges", "services", "runtimeclasses.node.k8s.io",
+                    "clusterroles.rbac.authorization.k8s.io", "clusterrolebindings.rbac.authorization.k8s.io",
+                    "roles.rbac.authorization.k8s.io", "rolebindings.rbac.authorization.k8s.io"};
+                const auto kind_key = r.group.empty() ? r.plural : r.plural + "." + r.group;
+                if (!apply && !kCreateOnUpdate.count(kind_key)) throw NotFound(r.plural, r.group, t.name);
                 auto object = objects::PrepareCreate(r, incoming, t.ns);
                 if (objects::Name(object) != t.name) throw BadRequest("the name of the object does not match the name on the URL");
                 if (IsDefinitions(r)) Crds::Validate(object);
