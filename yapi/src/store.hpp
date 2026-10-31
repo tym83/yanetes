@@ -38,6 +38,10 @@ struct WatchEvent {
     std::uint64_t rv = 0;
     std::string ns;
     userver::formats::json::Value object;
+    // The object as it was before this change: missing when it did not
+    // exist; known only for events the watch cache saw happen.
+    userver::formats::json::Value prev;
+    bool prev_known = false;
 };
 
 // Objects live in YDB, one revision counter per resource: Kubernetes only

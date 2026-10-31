@@ -60,6 +60,13 @@ func main() {
 			ns = "perf"
 		}
 		_, _ = client.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
+		// Pods wait for the namespace's default service account, as admission does.
+		for range 100 {
+			if _, err := client.CoreV1().ServiceAccounts(ns).Get(ctx, "default", metav1.GetOptions{}); err == nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
 		run("create pod", count, *workers, func(i int) error {
 			_, err := client.CoreV1().Pods(ns).Create(ctx, fakePod(i), metav1.CreateOptions{})
 			return ignoreExists(err)

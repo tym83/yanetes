@@ -884,13 +884,19 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 if (one && labels.Matches((*one)["metadata"]["labels"])) found.push_back(*one);
                 return render(found, std::to_string(store_.Revision(r)), "");
             }
-            auto page = store_.List(r, ns, limit, after_ns, after_name);
+            // From the watch cache when it has caught up, as upstream serves
+            // lists; from YDB otherwise.
+            auto cached = watch_.List(r, ns, limit, after_ns, after_name);
+            auto page = cached ? std::move(*cached) : store_.List(r, ns, limit, after_ns, after_name);
             for (auto& item : page.items) {
                 if (labels.Matches(item["metadata"]["labels"]) && FieldsMatch(r, fields, item)) found.push_back(std::move(item));
             }
             // Pages after the first report the revision of the first.
             const auto rv = cont.rv > 0 ? static_cast<std::uint64_t>(cont.rv) : page.rv;
-            remaining = page.last_name.empty() ? -1 : static_cast<std::int64_t>(store_.Count(r, ns, page.last_ns, page.last_name));
+            if (!page.last_name.empty()) {
+                auto counted = cached ? watch_.Count(r, ns, page.last_ns, page.last_name) : std::nullopt;
+                remaining = static_cast<std::int64_t>(counted ? *counted : store_.Count(r, ns, page.last_ns, page.last_name));
+            }
             return render(found, std::to_string(rv), page.last_name.empty() ? "" : EncodeContinue(static_cast<std::int64_t>(rv), page.last_ns, page.last_name, cont.inconsistent || cont.rv < 0));
         }
         if (method == http::HttpMethod::kPost) {
@@ -1991,34 +1997,22 @@ void Api::HandleStreamRequest(
         };
 
         // With a selector, an object that stops matching leaves the watch
-        // as DELETED and one that starts matching joins as ADDED, so the
-        // watch keeps the keys of what it has shown, as of a list taken at
-        // seeded_rv. Changes older than that list are judged by the version
-        // before them in the event log.
+        // as DELETED and one that starts matching joins as ADDED: whether it
+        // matched before comes with the change from the watch cache, or,
+        // for changes older than the cache keeps, from the event log.
         const bool selective = !labels.Empty() || !fields.Empty();
-        std::set<std::pair<std::string, std::string>> shown, judged;
-        std::uint64_t seeded_rv = 0;
-        auto key_of = [](const Value& o) { return std::make_pair(objects::Namespace(o), objects::Name(o)); };
 
         std::uint64_t after = ParseRv(rv_arg);
         std::vector<Value> initial_objects;
+        std::shared_ptr<Subscription> sub;
         if (initial) {
-            auto page = store_.List(r, ns, 0, "", "");
-            after = page.rv;
-            for (auto& item : page.items) {
-                if (matches(objects::Namespace(item), item)) {
-                    if (selective) shown.insert(key_of(item));
-                    initial_objects.push_back(std::move(item));
-                }
+            auto snap = watch_.SubscribeWithSnapshot(r, ns);
+            after = snap->rv;
+            sub = std::move(snap->sub);
+            for (auto& item : snap->items) {
+                if (matches(objects::Namespace(item), item)) initial_objects.push_back(std::move(item));
             }
         } else {
-            if (selective) {
-                auto page = store_.List(r, ns, 0, "", "");
-                seeded_rv = page.rv;
-                for (const auto& item : page.items) {
-                    if (matches(objects::Namespace(item), item)) shown.insert(key_of(item));
-                }
-            }
             // Events at or before the compacted revision are gone.
             const auto compacted = store_.Compacted(r);
             if (after < compacted) {
@@ -2028,8 +2022,8 @@ void Api::HandleStreamRequest(
                 stream.PushBodyChunk(json::ToString(Event("ERROR", gone.ToStatus())) + "\n", deadline);
                 return;
             }
+            sub = watch_.Subscribe(r, after);
         }
-        auto sub = watch_.Subscribe(r, after);
         stream.SetStatusCode(200);
         stream.SetEndOfHeaders();
         // The headers leave with the first piece of body. A watch with
@@ -2063,32 +2057,28 @@ void Api::HandleStreamRequest(
             }
             stream.PushBodyChunk(json::ToString(event) + "\n", deadline);
         };
-        auto deliver = [&](const std::string& type, const std::string& event_ns, const Value& object, std::uint64_t rv) {
-            const bool now = matches(event_ns, object);
+        auto deliver = [&](const WatchEvent& e) {
+            const bool now = matches(e.ns, e.object);
             if (!selective) {
-                if (now) send(Event(type, object));
+                if (now) send(Event(e.type, e.object));
                 return;
             }
-            const auto key = key_of(object);
-            if (rv <= seeded_rv && judged.insert(key).second) {
-                const auto before = type == "ADDED" ? std::nullopt : store_.EventBefore(r, key.first, key.second, rv);
-                if (before && before->type != "DELETED" && matches(before->ns, before->object)) {
-                    shown.insert(key);
-                } else if (before || type == "ADDED") {
-                    shown.erase(key);
+            // A creation is new to every watch, whatever came before it.
+            bool was = false;
+            if (e.type != "ADDED") {
+                if (e.prev_known) {
+                    was = !e.prev.IsMissing() && matches(e.ns, e.prev);
+                } else {
+                    const auto before = store_.EventBefore(r, e.ns, objects::Name(e.object), e.rv);
+                    was = before && before->type != "DELETED" && matches(before->ns, before->object);
                 }
             }
-            // A creation is new to every watch, whatever came before it.
-            const bool was = type != "ADDED" && shown.count(key) > 0;
-            if (type == "DELETED") {
-                if (was || now) send(Event("DELETED", object));
-                shown.erase(key);
+            if (e.type == "DELETED") {
+                if (was || now) send(Event("DELETED", e.object));
             } else if (now) {
-                send(Event(was ? "MODIFIED" : "ADDED", object));
-                shown.insert(key);
+                send(Event(was ? "MODIFIED" : "ADDED", e.object));
             } else if (was) {
-                send(Event("DELETED", object));
-                shown.erase(key);
+                send(Event("DELETED", e.object));
             }
         };
         for (const auto& o : initial_objects) send(Event("ADDED", o));
@@ -2099,7 +2089,7 @@ void Api::HandleStreamRequest(
             if (events.empty()) break;
             for (const auto& e : events) {
                 if (e.rv > sub->ReplayUntil()) break;
-                deliver(e.type, e.ns, e.object, e.rv);
+                deliver(e);
                 last = e.rv;
             }
             if (events.back().rv >= sub->ReplayUntil()) break;
@@ -2118,7 +2108,7 @@ void Api::HandleStreamRequest(
             }
             if (e) {
                 last = e->rv;
-                deliver(e->type, e->ns, e->object, e->rv);
+                deliver(*e);
             }
             if (bookmarks && std::chrono::steady_clock::now() - last_bookmark > std::chrono::seconds(30)) {
                 send(Bookmark(r, std::max(last, watch_.Delivered(r)), false));

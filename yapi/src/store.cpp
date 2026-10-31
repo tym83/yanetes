@@ -1,5 +1,8 @@
 #include <store.hpp>
 
+#include <algorithm>
+#include <limits>
+
 #include <deque>
 #include <map>
 
@@ -277,46 +280,69 @@ Store::Page Store::List(
     const std::string& after_ns,
     const std::string& after_name
 ) {
-    // One more than asked tells whether there is a next page.
-    std::uint64_t fetch = limit == 0 ? std::numeric_limits<std::uint32_t>::max() : limit + 1;
-    auto res = ns.empty() ? table_->ExecuteQuery(
-                                kListAll,
-                                "$resource",
-                                ydb::Utf8{r.Key()},
-                                "$after_ns",
-                                ydb::Utf8{after_ns},
-                                "$after_name",
-                                ydb::Utf8{after_name},
-                                "$limit",
-                                fetch
-                            )
-                          : table_->ExecuteQuery(
-                                kListNs,
-                                "$resource",
-                                ydb::Utf8{r.Key()},
-                                "$ns",
-                                ydb::Utf8{ns},
-                                "$after_name",
-                                ydb::Utf8{after_name},
-                                "$limit",
-                                fetch
-                            );
+    // Big lists come out of YDB a thousand rows at a time, all in one
+    // snapshot, so the whole list is of one moment. One more row than asked
+    // tells whether there is a next page.
+    constexpr std::uint64_t kChunk = 1000;
+    const std::uint64_t want = limit == 0 ? std::numeric_limits<std::uint64_t>::max() : limit + 1;
+    ydb::OperationSettings settings;
+    settings.tx_mode = ydb::TransactionMode::kSnapshotRO;
+    settings.client_timeout_ms = std::chrono::seconds(30);
+    auto tx = table_->Begin("list", settings);
     Page page;
-    page.rv = FirstRv(res.GetCursor(0));
-    bool more = false;
+    std::string cursor_ns = after_ns, cursor_name = after_name;
+    std::uint64_t seen = 0;
+    bool more = false, first = true;
     std::string last_ns, last_name;
-    for (auto row : res.GetCursor(1)) {
-        auto row_ns = row.Get<std::optional<ydb::Utf8>>("ns").value_or(ydb::Utf8{});
-        auto row_name = row.Get<std::optional<ydb::Utf8>>("name").value_or(ydb::Utf8{});
-        auto value = row.Get<std::optional<std::string>>("value").value_or("{}");
-        if (limit != 0 && page.items.size() == limit) {
-            more = true;
-            break;
+    while (true) {
+        const std::uint64_t fetch = std::min(kChunk, want - seen);
+        auto res = ns.empty() ? tx.Execute(
+                                    settings,
+                                    kListAll,
+                                    "$resource",
+                                    ydb::Utf8{r.Key()},
+                                    "$after_ns",
+                                    ydb::Utf8{cursor_ns},
+                                    "$after_name",
+                                    ydb::Utf8{cursor_name},
+                                    "$limit",
+                                    fetch
+                                )
+                              : tx.Execute(
+                                    settings,
+                                    kListNs,
+                                    "$resource",
+                                    ydb::Utf8{r.Key()},
+                                    "$ns",
+                                    ydb::Utf8{ns},
+                                    "$after_name",
+                                    ydb::Utf8{cursor_name},
+                                    "$limit",
+                                    fetch
+                                );
+        if (first) {
+            page.rv = FirstRv(res.GetCursor(0));
+            first = false;
         }
-        page.items.push_back(json::FromString(value));
-        last_ns = row_ns.GetUnderlying();
-        last_name = row_name.GetUnderlying();
+        std::uint64_t rows = 0;
+        for (auto row : res.GetCursor(1)) {
+            ++rows;
+            ++seen;
+            auto row_ns = row.Get<std::optional<ydb::Utf8>>("ns").value_or(ydb::Utf8{}).GetUnderlying();
+            auto row_name = row.Get<std::optional<ydb::Utf8>>("name").value_or(ydb::Utf8{}).GetUnderlying();
+            cursor_ns = row_ns;
+            cursor_name = row_name;
+            if (limit != 0 && page.items.size() == limit) {
+                more = true;
+                break;
+            }
+            page.items.push_back(json::FromString(row.Get<std::optional<std::string>>("value").value_or("{}")));
+            last_ns = std::move(row_ns);
+            last_name = std::move(row_name);
+        }
+        if (more || rows < fetch || seen >= want) break;
     }
+    tx.Commit();
     if (more) {
         page.last_ns = last_ns;
         page.last_name = last_name;
@@ -528,8 +554,11 @@ std::uint64_t Store::Compacted(const Resource& r) {
 }
 
 std::uint64_t Store::Count(const Resource& r, const std::string& ns, const std::string& after_ns, const std::string& after_name) {
-    auto res = ns.empty() ? table_->ExecuteQuery(kCountAll, "$resource", ydb::Utf8{r.Key()}, "$after_ns", ydb::Utf8{after_ns}, "$after_name", ydb::Utf8{after_name})
-                          : table_->ExecuteQuery(kCountNs, "$resource", ydb::Utf8{r.Key()}, "$ns", ydb::Utf8{ns}, "$after_name", ydb::Utf8{after_name});
+    // Counting a big resource reads all of it: more than the default second.
+    ydb::OperationSettings settings;
+    settings.client_timeout_ms = std::chrono::seconds(30);
+    auto res = ns.empty() ? table_->ExecuteQuery(settings, kCountAll, "$resource", ydb::Utf8{r.Key()}, "$after_ns", ydb::Utf8{after_ns}, "$after_name", ydb::Utf8{after_name})
+                          : table_->ExecuteQuery(settings, kCountNs, "$resource", ydb::Utf8{r.Key()}, "$ns", ydb::Utf8{ns}, "$after_name", ydb::Utf8{after_name});
     for (auto row : res.GetSingleCursor()) return row.Get<std::optional<std::uint64_t>>("n").value_or(0);
     return 0;
 }
