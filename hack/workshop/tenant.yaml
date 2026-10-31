@@ -11,5 +11,5 @@ spec:
   monitoring: false
   seaweedfs: false
   resourceQuotas:
-    cpu: "60"
+    cpu: "100"
     memory: 128Gi
