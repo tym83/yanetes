@@ -351,6 +351,16 @@ Attributes RequestAttributes(const http::HttpRequest& request, const std::vector
     const bool watch = watch_arg == "true" || watch_arg == "1";
     if (method == "get" || method == "head") {
         a.verb = watch ? "watch" : a.name.empty() ? "list" : "get";
+        // A list or watch of one object by name is about that object, so a
+        // rule limited to resourceNames grants it, as upstream decides.
+        if (a.name.empty()) {
+            const auto selector = request.GetArg("fieldSelector");
+            for (const auto* prefix : {"metadata.name=", "metadata.name=="}) {
+                const std::string p(prefix);
+                if (selector.starts_with(p) && selector.find(',') == std::string::npos) a.name = selector.substr(p.size());
+            }
+            if (a.name.starts_with("=")) a.name.erase(0, 1);
+        }
     } else if (method == "post") {
         a.verb = "create";
     } else if (method == "put") {
