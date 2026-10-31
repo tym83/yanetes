@@ -1,5 +1,7 @@
 #include <validation.hpp>
 
+#include <userver/formats/json/serialize.hpp>
+
 #include <arpa/inet.h>
 
 #include <regex>
@@ -145,8 +147,10 @@ void ValidateUpdate(const Resource& r, const Value& old_object, const Value& obj
     if (r.group == "scheduling.k8s.io" && r.plural == "priorityclasses") {
         // A priority already given to pods stays what it was.
         Problems p;
-        if (old_object["value"] != object["value"]) p.push_back("value: Forbidden: may not be changed in an update.");
-        if (old_object["preemptionPolicy"] != object["preemptionPolicy"]) {
+        // Absent fields compare as their JSON text: a missing value throws.
+        auto text = [](const Value& v) { return v.IsMissing() ? std::string() : userver::formats::json::ToString(v); };
+        if (text(old_object["value"]) != text(object["value"])) p.push_back("value: Forbidden: may not be changed in an update.");
+        if (text(old_object["preemptionPolicy"]) != text(object["preemptionPolicy"])) {
             p.push_back("preemptionPolicy: Invalid value: " + Quote(object["preemptionPolicy"].As<std::string>("")) + ": field is immutable");
         }
         if (p.empty()) return;
