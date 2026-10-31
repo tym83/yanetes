@@ -195,6 +195,7 @@ func (p *Planner) schedule(ctx context.Context, key string) error {
 	fits, reasons := p.filter(pod, state)
 	if len(fits) == 0 {
 		p.unschedulable(ctx, pod, len(nodes), reasons)
+		p.preempt(ctx, pod, state)
 		p.mu.Lock()
 		p.waiting[key] = struct{}{}
 		p.mu.Unlock()
@@ -272,6 +273,24 @@ func portKey(ip string, proto corev1.Protocol, port int32) string {
 	return fmt.Sprintf("%s/%s/%d", ip, proto, port)
 }
 
+// add counts a pod in on the node.
+func (s *nodeState) add(pod *corev1.Pod) {
+	for name, q := range resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{}) {
+		cur := s.requested[name]
+		cur.Add(q)
+		s.requested[name] = cur
+	}
+	s.podCount++
+	s.pods = append(s.pods, pod)
+	for _, c := range pod.Spec.Containers {
+		for _, port := range c.Ports {
+			if port.HostPort > 0 {
+				s.hostPorts[portKey(port.HostIP, port.Protocol, port.HostPort)] = true
+			}
+		}
+	}
+}
+
 func (p *Planner) snapshot(nodes []*corev1.Node) (map[string]*nodeState, error) {
 	state := make(map[string]*nodeState, len(nodes))
 	for _, n := range nodes {
@@ -282,23 +301,8 @@ func (p *Planner) snapshot(nodes []*corev1.Node) (map[string]*nodeState, error) 
 		return nil, err
 	}
 	add := func(pod *corev1.Pod, node string) {
-		s := state[node]
-		if s == nil {
-			return
-		}
-		for name, q := range resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{}) {
-			cur := s.requested[name]
-			cur.Add(q)
-			s.requested[name] = cur
-		}
-		s.podCount++
-		s.pods = append(s.pods, pod)
-		for _, c := range pod.Spec.Containers {
-			for _, port := range c.Ports {
-				if port.HostPort > 0 {
-					s.hostPorts[portKey(port.HostIP, port.Protocol, port.HostPort)] = true
-				}
-			}
+		if s := state[node]; s != nil {
+			s.add(pod)
 		}
 	}
 	seen := map[types.UID]bool{}

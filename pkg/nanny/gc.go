@@ -380,6 +380,26 @@ func (g *GC) foreground(ctx context.Context, uid types.UID, n *gcNode) error {
 			}
 		}
 		if !d.deleting {
+			// A dependent with another owner that stays keeps living; it
+			// only lets go of the owner being deleted, as upstream's
+			// collector does.
+			staying := false
+			for _, ref := range d.owners {
+				if ref.UID == uid {
+					continue
+				}
+				state, err := g.ownerState(ctx, d.namespace, ref)
+				if err != nil {
+					return err
+				}
+				staying = staying || state == ownerPresent
+			}
+			if staying {
+				if err := g.dropOwners(ctx, dep, d, []metav1.OwnerReference{{UID: uid}}); err != nil {
+					return err
+				}
+				continue
+			}
 			policy := metav1.DeletePropagationBackground
 			if len(g.dependentsOf(dep)) > 0 {
 				policy = metav1.DeletePropagationForeground

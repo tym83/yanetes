@@ -11,7 +11,7 @@ namespace yapi::validation {
 void Validate(const Resource& r, const userver::formats::json::Value& object);
 
 // What an update may not change: data of an immutable ConfigMap or Secret,
-// and immutable itself once set.
+// and immutable itself once set; a PriorityClass's value and policy.
 void ValidateUpdate(const Resource& r, const userver::formats::json::Value& old_object, const userver::formats::json::Value& object);
 
 }  // namespace yapi::validation

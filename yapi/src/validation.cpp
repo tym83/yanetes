@@ -142,6 +142,17 @@ void Validate(const Resource& r, const Value& object) {
 }
 
 void ValidateUpdate(const Resource& r, const Value& old_object, const Value& object) {
+    if (r.group == "scheduling.k8s.io" && r.plural == "priorityclasses") {
+        // A priority already given to pods stays what it was.
+        Problems p;
+        if (old_object["value"] != object["value"]) p.push_back("value: Forbidden: may not be changed in an update.");
+        if (old_object["preemptionPolicy"] != object["preemptionPolicy"]) {
+            p.push_back("preemptionPolicy: Invalid value: " + Quote(object["preemptionPolicy"].As<std::string>("")) + ": field is immutable");
+        }
+        if (p.empty()) return;
+        std::string msg = p.size() == 1 ? p[0] : "[" + p[0] + ", " + p[1] + "]";
+        throw Invalid(r.kind, r.group, objects::Name(object), msg);
+    }
     if (!(r.group.empty() && (r.plural == "configmaps" || r.plural == "secrets"))) return;
     if (!old_object["immutable"].As<bool>(false)) return;
     Problems p;
