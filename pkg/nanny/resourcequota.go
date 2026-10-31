@@ -7,6 +7,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -67,7 +68,20 @@ func NewResourceQuotas(client kubernetes.Interface, meta metadata.Interface, fac
 		return out, nil
 	}
 	q.loop = newLoop("resourcequota", 5, q.sync)
-	_, _ = factory.Core().V1().ResourceQuotas().Informer().AddEventHandler(q.loop.handlers())
+	// A write of status alone, as admission makes when it charges a quota,
+	// is no reason to recount: the caches may not have the object charged
+	// for yet, and a recount from them would take the charge back. Upstream
+	// recounts on changes of the hard limits only.
+	_, _ = factory.Core().V1().ResourceQuotas().Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: q.loop.addObject,
+		UpdateFunc: func(oldObj, obj any) {
+			before, after := oldObj.(*corev1.ResourceQuota), obj.(*corev1.ResourceQuota)
+			if !apiequality.Semantic.DeepEqual(before.Spec.Hard, after.Spec.Hard) ||
+				!apiequality.Semantic.DeepEqual(after.Spec.Hard, after.Status.Hard) {
+				q.loop.addObject(obj)
+			}
+		},
+	})
 	byNamespace := func(obj any) {
 		if o, ok := unwrap(obj).(metav1.Object); ok {
 			q.wake(o.GetNamespace())

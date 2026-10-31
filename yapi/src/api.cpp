@@ -362,15 +362,20 @@ bool Flag(const http::HttpRequest& req, std::string_view name) {
 // A continue token: where the next page starts and the revision the
 // list was read at, so every page reports the same one. -1 is upstream's
 // "inconsistent": continue at the current revision.
+// A continue token: where the list stopped and at which revision. One
+// handed out after the revision was compacted away continues inconsistently,
+// at whatever revision the next pages are read, and expires no more.
 struct Continue {
     std::int64_t rv = 0;
     std::string ns, name;
+    bool inconsistent = false;
 };
 
-std::string EncodeContinue(std::int64_t rv, const std::string& ns, const std::string& name) {
+std::string EncodeContinue(std::int64_t rv, const std::string& ns, const std::string& name, bool inconsistent = false) {
     ValueBuilder b(json::Type::kObject);
     b["v"] = "meta.k8s.io/v1";
     b["rv"] = rv;
+    if (inconsistent) b["inconsistent"] = true;
     b["start"] = ns + "/" + name;
     return userver::crypto::base64::Base64UrlEncode(json::ToString(b.ExtractValue()), userver::crypto::base64::Pad::kWithout);
 }
@@ -382,7 +387,7 @@ Continue DecodeContinue(const std::string& token) {
         auto start = v["start"].As<std::string>();
         auto slash = start.find('/');
         if (slash == std::string::npos) throw std::runtime_error("no start");
-        return {v["rv"].As<std::int64_t>(), start.substr(0, slash), start.substr(slash + 1)};
+        return {v["rv"].As<std::int64_t>(), start.substr(0, slash), start.substr(slash + 1), v["inconsistent"].As<bool>(false)};
     } catch (const std::exception&) {
         throw BadRequest("continue key is not valid: " + token);
     }
@@ -783,7 +788,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             const auto cont = DecodeContinue(Arg(request, "continue"));
             const auto& after_ns = cont.ns;
             const auto& after_name = cont.name;
-            if (cont.rv > 0 && static_cast<std::uint64_t>(cont.rv) <= store_.Compacted(r)) {
+            if (cont.rv > 0 && !cont.inconsistent && static_cast<std::uint64_t>(cont.rv) <= store_.Compacted(r)) {
                 ApiError gone(410, "Expired",
                               "The provided continue parameter is too old to display a consistent list result. You can start a new list without the continue parameter, or use the continue token in this response to retrieve the remainder of the results. Continuing with the provided token results in an inconsistent list - objects that were created, modified, or deleted between the time the first chunk was returned and now may show up in the list.");
                 ValueBuilder status(gone.ToStatus());
@@ -824,7 +829,7 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
             // Pages after the first report the revision of the first.
             const auto rv = cont.rv > 0 ? static_cast<std::uint64_t>(cont.rv) : page.rv;
             remaining = page.last_name.empty() ? -1 : static_cast<std::int64_t>(store_.Count(r, ns, page.last_ns, page.last_name));
-            return render(found, std::to_string(rv), page.last_name.empty() ? "" : EncodeContinue(static_cast<std::int64_t>(rv), page.last_ns, page.last_name));
+            return render(found, std::to_string(rv), page.last_name.empty() ? "" : EncodeContinue(static_cast<std::int64_t>(rv), page.last_ns, page.last_name, cont.inconsistent || cont.rv < 0));
         }
         if (method == http::HttpMethod::kPost) {
             auto parsed = ReadBody(request.RequestBody(), request.GetHeader(userver::http::headers::kContentType));

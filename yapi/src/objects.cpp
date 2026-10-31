@@ -291,6 +291,12 @@ Value Defaults(const Resource& r, Value object) {
     if (r.group == "batch" && r.plural == "cronjobs" && object["spec"]["jobTemplate"]["spec"]["template"]["spec"].IsObject()) {
         b["spec"]["jobTemplate"]["spec"]["template"]["spec"] = PodSpecDefaults(object["spec"]["jobTemplate"]["spec"]["template"]["spec"]);
     }
+    // A pod certificate is good for a day unless asked for less, as
+    // upstream defaults it; signers read the field without a check.
+    if (r.group == "certificates.k8s.io" && r.plural == "podcertificaterequests" && object["spec"].IsObject() &&
+        !object["spec"].HasMember("maxExpirationSeconds")) {
+        b["spec"]["maxExpirationSeconds"] = 86400;
+    }
     if (r.group == "batch" && r.plural == "jobs") {
         auto spec = b["spec"];
         const auto in = object["spec"];
