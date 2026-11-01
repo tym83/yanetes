@@ -86,6 +86,12 @@ public:
         const std::string& after_ns,
         const std::string& after_name
     );
+    // What the cache holds once it has reached a revision this process
+    // wrote, without asking the store: as fresh as admission needs, and
+    // fresher than the informers upstream's admission reads.
+    std::vector<userver::formats::json::Value> Objects(const Resource& r, const std::string& ns, std::uint64_t at_least);
+    std::optional<userver::formats::json::Value> Object(const Resource& r, const std::string& ns, const std::string& name, std::uint64_t at_least);
+
     // How many objects come after a key, for remainingItemCount.
     std::optional<std::uint64_t> Count(const Resource& r, const std::string& ns, const std::string& after_ns, const std::string& after_name);
 
@@ -107,6 +113,8 @@ private:
     Channel& ChannelFor(const Resource& r);
     // Waits until the cache holds the store's newest revision.
     bool CaughtUp(Channel& ch);
+    // Waits, briefly, until it holds a given one.
+    void Reach(Channel& ch, std::uint64_t rv);
     void Run(Channel& ch);
     void Load(Channel& ch);
 

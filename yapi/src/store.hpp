@@ -99,6 +99,13 @@ public:
 
     void SetWatch(Watch* watch) { watch_ = watch; }
 
+    // Reads for admission and the like, from the watch cache when there is
+    // one: as fresh as upstream's informers, without a round trip to YDB.
+    std::vector<userver::formats::json::Value> ListInformed(const Resource& r, const std::string& ns);
+    std::optional<userver::formats::json::Value> GetInformed(const Resource& r, const std::string& ns, const std::string& name);
+    // The newest revision of a resource this process has written.
+    std::uint64_t LastWritten(const Resource& r);
+
 private:
     struct Pending;
     struct Batcher;

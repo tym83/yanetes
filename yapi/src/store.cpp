@@ -1,6 +1,7 @@
 #include <store.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 
 #include <deque>
@@ -359,6 +360,7 @@ struct Store::Pending {
 
 struct Store::Batcher {
     const Resource* resource = nullptr;
+    std::atomic<std::uint64_t> written{0};  // the newest revision this process committed
     userver::engine::Mutex mutex;
     std::deque<Pending*> queue;
     userver::engine::SingleConsumerEvent kick;
@@ -422,6 +424,7 @@ void Store::Commit(const Resource& r, std::vector<Pending*>& batch) {
     };
     std::vector<Outcome> outcomes;
     bool written = false;
+    std::uint64_t committed = 0;
     try {
         userver::ydb::RetryTxSettings settings;
         settings.tx_mode = ydb::TransactionMode::kSerializableRW;
@@ -491,6 +494,7 @@ void Store::Commit(const Resource& r, std::vector<Pending*>& batch) {
             }
             tx.Execute(kBatchWrite, "$resource", res, "$rv", rv, "$puts", puts, "$dels", dels, "$events", events);
             written = true;
+            committed = rv;
             return ydb::TxAction::kCommit;
         });
     } catch (...) {
@@ -498,7 +502,12 @@ void Store::Commit(const Resource& r, std::vector<Pending*>& batch) {
         for (auto* p : batch) p->promise.set_exception(error);
         return;
     }
-    if (written && watch_ != nullptr) watch_->Kick(r);
+    if (written) {
+        auto& counter = BatcherFor(r).written;
+        for (auto seen = counter.load(); seen < committed && !counter.compare_exchange_weak(seen, committed);) {
+        }
+        if (watch_ != nullptr) watch_->Kick(r);
+    }
     for (std::size_t i = 0; i < batch.size(); ++i) {
         if (outcomes[i].error) {
             batch[i]->promise.set_exception(outcomes[i].error);
@@ -527,6 +536,22 @@ std::vector<WatchEvent> Store::EventsAfter(const Resource& r, std::uint64_t rv, 
         out.push_back(std::move(e));
     }
     return out;
+}
+
+std::uint64_t Store::LastWritten(const Resource& r) {
+    std::unique_lock lock(batchers_mutex_);
+    auto it = batchers_.find(r.Key());
+    return it == batchers_.end() ? 0 : it->second->written.load();
+}
+
+std::vector<json::Value> Store::ListInformed(const Resource& r, const std::string& ns) {
+    if (watch_ != nullptr) return watch_->Objects(r, ns, LastWritten(r));
+    return List(r, ns, 0, "", "").items;
+}
+
+std::optional<json::Value> Store::GetInformed(const Resource& r, const std::string& ns, const std::string& name) {
+    if (watch_ != nullptr) return watch_->Object(r, ns, name, LastWritten(r));
+    return Get(r, ns, name);
 }
 
 std::optional<WatchEvent> Store::EventBefore(const Resource& r, const std::string& ns, const std::string& name, std::uint64_t rv) {

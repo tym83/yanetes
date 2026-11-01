@@ -41,7 +41,7 @@ Value ServiceAccount(Store& store, Value pod) {
     const auto ns = objects::Namespace(pod);
     const auto spec = pod["spec"];
     const auto sa_name = spec["serviceAccountName"].As<std::string>("default");
-    auto sa = store.Get(Core("serviceaccounts"), ns, sa_name);
+    auto sa = store.GetInformed(Core("serviceaccounts"), ns, sa_name);
     if (!sa) {
         throw Forbidden("pods", objects::Name(pod), "error looking up service account " + ns + "/" + sa_name + ": serviceaccount \"" + sa_name + "\" not found");
     }
@@ -138,12 +138,12 @@ Value Priority(Store& store, Value pod) {
     auto class_name = pod["spec"]["priorityClassName"].As<std::string>("");
     std::optional<Value> pc;
     if (!class_name.empty()) {
-        pc = store.Get(classes, "", class_name);
+        pc = store.GetInformed(classes, "", class_name);
         if (!pc) {
             throw Forbidden("pods", objects::Name(pod), "no PriorityClass with name " + class_name + " was found");
         }
     } else {
-        for (const auto& c : store.List(classes, "", 0, "", "").items) {
+        for (const auto& c : store.ListInformed(classes, "")) {
             if (c["globalDefault"].As<bool>(false)) pc = c;
         }
     }
@@ -197,7 +197,7 @@ std::string Show(const std::string& resource, long double v) { return quantity::
 // minimums, maximums and ratios.
 Value LimitRanges(Store& store, const Resource& r, Value object) {
     if (!(r.group.empty() && r.plural == "pods")) return object;
-    const auto ranges = store.List(*Registry::Builtin().Find("", "v1", "limitranges"), objects::Namespace(object), 0, "", "").items;
+    const auto ranges = store.ListInformed(*Registry::Builtin().Find("", "v1", "limitranges"), objects::Namespace(object));
     if (ranges.empty()) return object;
     Amounts default_limits, default_requests;
     for (const auto& lr : ranges) {
@@ -364,6 +364,10 @@ void Quotas(Store& store, const Resource& r, const Value& object) {
     if (ns.empty()) return;
     const auto& quotas_r = *Registry::Builtin().Find("", "v1", "resourcequotas");
     const auto usage = Usage(r, object);
+    // Most namespaces have no quota: the cache says so without a query.
+    // Where there are quotas they are charged from the store itself, so
+    // a charge never rests on a stale count.
+    if (store.ListInformed(quotas_r, ns).empty()) return;
     for (int attempt = 0; attempt < 10; ++attempt) {
         auto quotas = store.List(quotas_r, ns, 0, "", "").items;
         if (quotas.empty()) return;
@@ -440,7 +444,7 @@ Value RuntimeClass(Store& store, Value pod) {
         if (pod["spec"].HasMember("overhead")) throw Forbidden("pods", objects::Name(pod), "pod rejected: Pod Overhead set without corresponding RuntimeClass defined Overhead");
         return pod;
     }
-    auto rc = store.Get(*Registry::Builtin().Find("node.k8s.io", "v1", "runtimeclasses"), "", name);
+    auto rc = store.GetInformed(*Registry::Builtin().Find("node.k8s.io", "v1", "runtimeclasses"), "", name);
     if (!rc) throw Forbidden("pods", objects::Name(pod), "pod rejected: RuntimeClass \"" + name + "\" not found");
     ValueBuilder b(pod);
     const auto fixed = (*rc)["overhead"]["podFixed"];

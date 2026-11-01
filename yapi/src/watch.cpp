@@ -152,6 +152,35 @@ std::optional<Store::Page> Watch::List(
     return page;
 }
 
+void Watch::Reach(Channel& ch, std::uint64_t rv) {
+    {
+        std::unique_lock lock(ch.mutex);
+        if (ch.delivered >= rv) return;
+    }
+    ch.kick.Send();
+    std::unique_lock lock(ch.mutex);
+    ch.advanced.WaitFor(lock, kCatchUp, [&] { return ch.delivered >= rv; });
+}
+
+std::vector<userver::formats::json::Value> Watch::Objects(const Resource& r, const std::string& ns, std::uint64_t at_least) {
+    auto& ch = ChannelFor(r);
+    Reach(ch, at_least);
+    std::unique_lock lock(ch.mutex);
+    std::vector<userver::formats::json::Value> out;
+    auto it = ns.empty() ? ch.objects.begin() : ch.objects.lower_bound({ns, ""});
+    for (; it != ch.objects.end() && (ns.empty() || it->first.first == ns); ++it) out.push_back(it->second);
+    return out;
+}
+
+std::optional<userver::formats::json::Value> Watch::Object(const Resource& r, const std::string& ns, const std::string& name, std::uint64_t at_least) {
+    auto& ch = ChannelFor(r);
+    Reach(ch, at_least);
+    std::unique_lock lock(ch.mutex);
+    auto it = ch.objects.find({ns, name});
+    if (it == ch.objects.end()) return std::nullopt;
+    return it->second;
+}
+
 std::optional<std::uint64_t> Watch::Count(const Resource& r, const std::string& ns, const std::string& after_ns, const std::string& after_name) {
     auto& ch = ChannelFor(r);
     std::unique_lock lock(ch.mutex);
