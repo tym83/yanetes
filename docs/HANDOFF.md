@@ -243,8 +243,8 @@ volume), same KWOK, 30 001 nodes:
 4. `managedFields` (server-side apply field ownership) — absent today.
 5. Rename to Яnetes / `yanetes` (§9), README (English) + `README.ru.md`,
    publish `github.com/tym83/yanetes`. Show the README to the owner before
-   publishing. The repository has no remote yet: creating one needs the
-   owner (the agent's permission filter refused to upload).
+   publishing. Until then the code lives in the private repository
+   `github.com/tym83/yanetes`, branch `feat/skeleton`.
 6. Satire overlays from `docs/design.ru.md` (selectively; not the "Plus"
    subscription — dropped by the owner).
 7. Article (Russian) for Habr with the numbers.
