@@ -1,0 +1,55 @@
+# etcd for the upstream side of the comparison, on the terms YDB gets:
+# the same CPU and memory limits and the same replicated volume.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: etcd
+  namespace: tenant-yanetes
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: replicated
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: etcd
+  namespace: tenant-yanetes
+  labels:
+    app: etcd
+spec:
+  hostname: etcd
+  containers:
+  - name: etcd
+    image: registry.k8s.io/etcd:3.6.4-0
+    command:
+    - etcd
+    - --name=etcd
+    - --data-dir=/var/lib/etcd
+    - --listen-client-urls=http://0.0.0.0:2379
+    - --advertise-client-urls=http://etcd.tenant-yanetes.svc:2379
+    - --quota-backend-bytes=8589934592
+    - --auto-compaction-retention=1
+    ports:
+    - {name: client, containerPort: 2379}
+    resources:
+      requests: {cpu: "2", memory: 8Gi}
+      limits: {cpu: "8", memory: 16Gi}
+    volumeMounts:
+    - {name: data, mountPath: /var/lib/etcd}
+  volumes:
+  - name: data
+    persistentVolumeClaim:
+      claimName: etcd
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: tenant-yanetes
+spec:
+  selector: {app: etcd}
+  ports:
+  - {name: client, port: 2379}

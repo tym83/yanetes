@@ -1,4 +1,4 @@
-# Yandexnetes — tech research: Yandex open-source building blocks
+# Яnetes — tech research: Yandex open-source building blocks
 
 Checked 2026-10-30. Repo dates are from the GitHub API (`pushed_at`, latest release). "Not found" means I searched and found no public source, not that the thing does not exist.
 

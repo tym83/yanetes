@@ -1,0 +1,51 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+
+#include <google/protobuf/descriptor.h>
+
+#include <userver/formats/json/value.hpp>
+
+namespace yapi::proto {
+
+// Kubernetes clients send typed objects as protobuf and do not fall back to
+// JSON. This turns such a body into the JSON the rest of the server works
+// with, using the upstream generated.proto files loaded at startup. The
+// types upstream serializes by hand (Time, Quantity, IntOrString, ...) are
+// converted by hand here too.
+class Decoder {
+public:
+    explicit Decoder(const std::string& proto_dir);
+    ~Decoder();
+
+    static bool IsProtobuf(const std::string& body) { return body.starts_with(std::string_view("k8s\0", 4)); }
+
+    // Throws ApiError when the body is not a known object.
+    userver::formats::json::Value Decode(const std::string& body) const;
+
+    // The other way: an object (its apiVersion and kind say which) as the
+    // protobuf body upstream would send, "k8s\0" and a runtime.Unknown.
+    // nullopt for objects with no protobuf type, custom resources say.
+    std::optional<std::string> Encode(const userver::formats::json::Value& object) const;
+    // One frame of a protobuf watch stream: its length, then a WatchEvent
+    // whose object is encoded as above.
+    std::optional<std::string> EncodeWatchEvent(const std::string& type, const userver::formats::json::Value& object) const;
+
+    // The decoder of the server, once one is set up; nullptr before.
+    static const Decoder* Instance();
+    static void SetInstance(const Decoder* decoder);
+
+private:
+    // A message's bytes, from the cache when this version was encoded before.
+    std::shared_ptr<const std::string> EncodeMessage(const google::protobuf::Descriptor* desc, const userver::formats::json::Value& object) const;
+
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// Go's time.Duration.String().
+std::string GoDuration(std::int64_t nanoseconds);
+
+}  // namespace yapi::proto
