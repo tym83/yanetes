@@ -4,6 +4,8 @@
 #include <optional>
 #include <string>
 
+#include <google/protobuf/descriptor.h>
+
 #include <userver/formats/json/value.hpp>
 
 namespace yapi::proto {
@@ -36,6 +38,9 @@ public:
     static void SetInstance(const Decoder* decoder);
 
 private:
+    // A message's bytes, from the cache when this version was encoded before.
+    std::shared_ptr<const std::string> EncodeMessage(const google::protobuf::Descriptor* desc, const userver::formats::json::Value& object) const;
+
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

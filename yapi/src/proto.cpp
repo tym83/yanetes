@@ -6,6 +6,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -522,6 +523,58 @@ json::Value Decoder::Decode(const std::string& body) const {
     throw ApiError(415, "UnsupportedMediaType", "no protobuf schema for " + api_version + " " + kind);
 }
 
+namespace {
+
+// Encoded objects by uid, version and apiVersion: an object changes rarely
+// and is listed often, so each version is encoded once, as upstream's
+// cacher keeps serialized objects. Dropped wholesale when it grows big.
+struct EncodedCache {
+    std::mutex mutex;
+    std::unordered_map<std::string, std::shared_ptr<const std::string>> items;
+};
+EncodedCache& Encoded() {
+    static EncodedCache cache;
+    return cache;
+}
+constexpr std::size_t kMaxEncoded = 400'000;
+
+void AppendVarint(std::string& out, std::uint64_t v) {
+    while (v >= 0x80) {
+        out.push_back(static_cast<char>((v & 0x7f) | 0x80));
+        v >>= 7;
+    }
+    out.push_back(static_cast<char>(v));
+}
+
+// A length-delimited field: tag, length, bytes.
+void AppendBytes(std::string& out, int field, std::string_view bytes) {
+    AppendVarint(out, (static_cast<std::uint64_t>(field) << 3) | 2);
+    AppendVarint(out, bytes.size());
+    out.append(bytes);
+}
+
+}  // namespace
+
+std::shared_ptr<const std::string> Decoder::EncodeMessage(const pb::Descriptor* desc, const json::Value& object) const {
+    const auto& meta = object["metadata"];
+    std::string key;
+    if (meta.IsObject() && meta.HasMember("uid") && meta.HasMember("resourceVersion")) {
+        key = meta["uid"].As<std::string>("") + "/" + meta["resourceVersion"].As<std::string>("") + "/" + std::string(desc->full_name());
+        std::lock_guard lock(Encoded().mutex);
+        auto it = Encoded().items.find(key);
+        if (it != Encoded().items.end()) return it->second;
+    }
+    std::unique_ptr<pb::Message> msg(impl_->factory.GetPrototype(desc)->New());
+    Fill(*msg, object);
+    auto bytes = std::make_shared<const std::string>(msg->SerializeAsString());
+    if (!key.empty()) {
+        std::lock_guard lock(Encoded().mutex);
+        if (Encoded().items.size() >= kMaxEncoded) Encoded().items.clear();
+        Encoded().items.emplace(std::move(key), bytes);
+    }
+    return bytes;
+}
+
 std::optional<std::string> Decoder::Encode(const json::Value& object) const {
     const auto api_version = object["apiVersion"].As<std::string>("");
     const auto kind = object["kind"].As<std::string>("");
@@ -532,15 +585,26 @@ std::optional<std::string> Decoder::Encode(const json::Value& object) const {
     }
     const auto* unknown_desc = impl_->importer.pool()->FindMessageTypeByName("k8s.io.apimachinery.pkg.runtime.Unknown");
     if (!desc || !unknown_desc) return std::nullopt;
-    std::unique_ptr<pb::Message> msg(impl_->factory.GetPrototype(desc)->New());
-    Fill(*msg, object);
+    // A list is its metadata and its items, fields 1 and 2 in every list
+    // type: the items come from the cache of encoded objects.
+    std::string raw;
+    const auto* items_field = desc->FindFieldByName("items");
+    if (kind.ends_with("List") && items_field && items_field->number() == 2 && items_field->message_type() &&
+        desc->FindFieldByName("metadata") && desc->FindFieldByName("metadata")->number() == 1) {
+        std::unique_ptr<pb::Message> list_meta(impl_->factory.GetPrototype(desc->FindFieldByName("metadata")->message_type())->New());
+        Fill(*list_meta, object["metadata"]);
+        AppendBytes(raw, 1, list_meta->SerializeAsString());
+        for (const auto& item : object["items"]) AppendBytes(raw, 2, *EncodeMessage(items_field->message_type(), item));
+    } else {
+        raw = *EncodeMessage(desc, object);
+    }
     std::unique_ptr<pb::Message> unknown(impl_->factory.GetPrototype(unknown_desc)->New());
     const auto* ur = unknown->GetReflection();
     auto* type_meta = ur->MutableMessage(unknown.get(), unknown_desc->FindFieldByName("typeMeta"));
     const auto* td = type_meta->GetDescriptor();
     type_meta->GetReflection()->SetString(type_meta, td->FindFieldByName("apiVersion"), api_version);
     type_meta->GetReflection()->SetString(type_meta, td->FindFieldByName("kind"), kind);
-    ur->SetString(unknown.get(), unknown_desc->FindFieldByName("raw"), msg->SerializeAsString());
+    ur->SetString(unknown.get(), unknown_desc->FindFieldByName("raw"), std::move(raw));
     ur->SetString(unknown.get(), unknown_desc->FindFieldByName("contentEncoding"), "");
     ur->SetString(unknown.get(), unknown_desc->FindFieldByName("contentType"), "");
     return std::string("k8s\0", 4) + unknown->SerializeAsString();
