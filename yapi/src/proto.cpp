@@ -1,6 +1,8 @@
 #include <proto.hpp>
 
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -198,6 +200,252 @@ json::Value Convert(const pb::Message& m) {
     return out.ExtractValue();
 }
 
+
+// JSON back into a message, the reverse of Convert: the same hints say
+// which fields are inlined and which are named differently.
+bool ParseRfc3339(const std::string& text, std::int64_t& seconds, std::int32_t& nanos) {
+    std::tm tm{};
+    int year, mon, day, hour, min, sec;
+    if (std::sscanf(text.c_str(), "%d-%d-%dT%d:%d:%d", &year, &mon, &day, &hour, &min, &sec) != 6) return false;
+    tm.tm_year = year - 1900;
+    tm.tm_mon = mon - 1;
+    tm.tm_mday = day;
+    tm.tm_hour = hour;
+    tm.tm_min = min;
+    tm.tm_sec = sec;
+    seconds = timegm(&tm);
+    nanos = 0;
+    if (auto dot = text.find('.'); dot != std::string::npos) {
+        std::string digits;
+        for (std::size_t i = dot + 1; i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])); ++i) digits += text[i];
+        digits = (digits + "000000000").substr(0, 9);
+        nanos = std::stoi(digits);
+    }
+    return true;
+}
+
+// Go's time.ParseDuration for what GoDuration writes: "1h2m3.5s", "150ms".
+std::int64_t ParseGoDuration(const std::string& text) {
+    static const std::pair<const char*, double> kUnits[] = {
+        {"ns", 1}, {"us", 1e3}, {"µs", 1e3}, {"ms", 1e6}, {"s", 1e9}, {"m", 60e9}, {"h", 3600e9}};
+    double total = 0;
+    std::size_t i = 0;
+    const bool negative = !text.empty() && text[0] == '-';
+    if (negative) ++i;
+    while (i < text.size()) {
+        std::size_t used = 0;
+        double number = std::stod(text.substr(i), &used);
+        i += used;
+        double scale = 0;
+        std::size_t len = 0;
+        for (const auto& [unit, factor] : kUnits) {
+            const std::string u(unit);
+            if (text.compare(i, u.size(), u) == 0 && u.size() > len) {
+                scale = factor;
+                len = u.size();
+            }
+        }
+        if (len == 0) break;
+        total += number * scale;
+        i += len;
+    }
+    return static_cast<std::int64_t>(negative ? -total : total);
+}
+
+void Fill(pb::Message& m, const json::Value& v);
+
+// The types upstream marshals by hand; false for every other message.
+bool FillSpecial(pb::Message& m, const json::Value& v) {
+    const auto* d = m.GetDescriptor();
+    const auto* r = m.GetReflection();
+    const auto& name = d->full_name();
+    auto field = [&](const char* n) { return d->FindFieldByName(n); };
+    if (name == "k8s.io.apimachinery.pkg.apis.meta.v1.Time" || name == "k8s.io.apimachinery.pkg.apis.meta.v1.MicroTime") {
+        std::int64_t seconds = 0;
+        std::int32_t nanos = 0;
+        if (v.IsString() && ParseRfc3339(v.As<std::string>(), seconds, nanos)) {
+            r->SetInt64(&m, field("seconds"), seconds);
+            r->SetInt32(&m, field("nanos"), nanos);
+        }
+        return true;
+    }
+    if (name == "k8s.io.apimachinery.pkg.apis.meta.v1.Duration") {
+        if (v.IsString()) r->SetInt64(&m, field("duration"), ParseGoDuration(v.As<std::string>()));
+        return true;
+    }
+    if (name == "k8s.io.apimachinery.pkg.util.intstr.IntOrString") {
+        if (v.IsString()) {
+            r->SetInt64(&m, field("type"), 1);
+            r->SetString(&m, field("strVal"), v.As<std::string>());
+        } else {
+            r->SetInt64(&m, field("type"), 0);
+            r->SetInt32(&m, field("intVal"), v.As<std::int32_t>(0));
+        }
+        return true;
+    }
+    if (name == "k8s.io.apimachinery.pkg.api.resource.Quantity") {
+        r->SetString(&m, field("string"), v.IsString() ? v.As<std::string>() : json::ToString(v));
+        return true;
+    }
+    if (name == "k8s.io.apimachinery.pkg.runtime.RawExtension" || name == "k8s.io.apimachinery.pkg.apis.meta.v1.FieldsV1") {
+        const auto* raw = field("raw") ? field("raw") : field("Raw");
+        if (raw && !v.IsNull()) r->SetString(&m, raw, json::ToString(v));
+        return true;
+    }
+    static const std::string kExt = "k8s.io.apiextensions_apiserver.pkg.apis.apiextensions.";
+    if (name.starts_with(kExt)) {
+        const auto type = name.substr(name.rfind('.') + 1);
+        if (type == "JSON") {
+            r->SetString(&m, field("raw"), json::ToString(v));
+            return true;
+        }
+        if (type == "JSONSchemaPropsOrArray" || type == "JSONSchemaPropsOrBool" || type == "JSONSchemaPropsOrStringArray") {
+            if (v.IsObject()) {
+                Fill(*r->MutableMessage(&m, field("schema")), v);
+                if (type == "JSONSchemaPropsOrBool") r->SetBool(&m, field("allows"), true);
+            } else if (v.IsBool() && type == "JSONSchemaPropsOrBool") {
+                r->SetBool(&m, field("allows"), v.As<bool>());
+            } else if (v.IsArray()) {
+                const auto* list = field(type == "JSONSchemaPropsOrArray" ? "jSONSchemas" : "property");
+                for (const auto& item : v) {
+                    if (list->cpp_type() == pb::FieldDescriptor::CPPTYPE_MESSAGE) {
+                        Fill(*r->AddMessage(&m, list), item);
+                    } else {
+                        r->AddString(&m, list, item.As<std::string>(""));
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+void SetScalar(pb::Message& m, const pb::FieldDescriptor* f, const json::Value& v, bool add) {
+    const auto* r = m.GetReflection();
+    using T = pb::FieldDescriptor;
+    switch (f->cpp_type()) {
+        case T::CPPTYPE_INT32: {
+            auto x = v.IsString() ? std::stoi(v.As<std::string>()) : v.As<std::int32_t>(0);
+            add ? r->AddInt32(&m, f, x) : r->SetInt32(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_INT64: {
+            auto x = v.IsString() ? std::stoll(v.As<std::string>()) : v.As<std::int64_t>(0);
+            add ? r->AddInt64(&m, f, x) : r->SetInt64(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_UINT32: {
+            auto x = v.As<std::uint32_t>(0);
+            add ? r->AddUInt32(&m, f, x) : r->SetUInt32(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_UINT64: {
+            auto x = v.As<std::uint64_t>(0);
+            add ? r->AddUInt64(&m, f, x) : r->SetUInt64(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_DOUBLE: {
+            auto x = v.As<double>(0);
+            add ? r->AddDouble(&m, f, x) : r->SetDouble(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_FLOAT: {
+            auto x = static_cast<float>(v.As<double>(0));
+            add ? r->AddFloat(&m, f, x) : r->SetFloat(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_BOOL: {
+            auto x = v.As<bool>(false);
+            add ? r->AddBool(&m, f, x) : r->SetBool(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_ENUM: {
+            auto x = v.As<int>(0);
+            add ? r->AddEnumValue(&m, f, x) : r->SetEnumValue(&m, f, x);
+            break;
+        }
+        case T::CPPTYPE_STRING: {
+            std::string x = v.IsString() ? v.As<std::string>() : json::ToString(v);
+            if (f->type() == T::TYPE_BYTES) x = userver::crypto::base64::Base64Decode(x);
+            add ? r->AddString(&m, f, std::move(x)) : r->SetString(&m, f, std::move(x));
+            break;
+        }
+        case T::CPPTYPE_MESSAGE:
+            break;
+    }
+}
+
+void SetValue(pb::Message& m, const pb::FieldDescriptor* f, const json::Value& v, bool add) {
+    const auto* r = m.GetReflection();
+    if (f->cpp_type() != pb::FieldDescriptor::CPPTYPE_MESSAGE) {
+        SetScalar(m, f, v, add);
+        return;
+    }
+    auto* sub = add ? r->AddMessage(&m, f) : r->MutableMessage(&m, f);
+    if (!FillSpecial(*sub, v)) Fill(*sub, v);
+}
+
+// The fields of a message by their JSON names, worked out once per type
+// (per thread, so encoding never waits on a lock).
+struct FieldIndex {
+    std::unordered_map<std::string, const pb::FieldDescriptor*> by_name;
+    std::vector<const pb::FieldDescriptor*> inlined;
+};
+
+const FieldIndex& IndexOf(const pb::Descriptor* d) {
+    thread_local std::unordered_map<const pb::Descriptor*, FieldIndex> cache;
+    auto [it, fresh] = cache.try_emplace(d);
+    if (fresh) {
+        for (int i = 0; i < d->field_count(); ++i) {
+            const auto* f = d->field(i);
+            if (g_inline_fields.count(std::string(d->full_name()) + "." + std::string(f->name()))) {
+                it->second.inlined.push_back(f);
+            } else {
+                it->second.by_name[JsonName(d, f)] = f;
+            }
+        }
+    }
+    return it->second;
+}
+
+void Fill(pb::Message& m, const json::Value& v) {
+    if (!v.IsObject()) return;
+    const auto* d = m.GetDescriptor();
+    const auto* r = m.GetReflection();
+    const auto& index = IndexOf(d);
+    const auto& by_name = index.by_name;
+    const auto& inlined = index.inlined;
+    for (auto it = v.begin(); it != v.end(); ++it) {
+        if (it->IsNull()) continue;
+        auto found = by_name.find(it.GetName());
+        if (found == by_name.end()) continue;
+        const auto* f = found->second;
+        if (f->is_map()) {
+            if (!it->IsObject()) continue;
+            const auto* key = f->message_type()->FindFieldByName("key");
+            const auto* value = f->message_type()->FindFieldByName("value");
+            for (auto e = it->begin(); e != it->end(); ++e) {
+                auto* entry = r->AddMessage(&m, f);
+                entry->GetReflection()->SetString(entry, key, e.GetName());
+                SetValue(*entry, value, *e, false);
+            }
+        } else if (f->is_repeated()) {
+            if (!it->IsArray()) continue;
+            for (const auto& item : *it) SetValue(m, f, item, true);
+        } else {
+            SetValue(m, f, *it, false);
+        }
+    }
+    // An inlined struct takes the keys of its own fields from this level.
+    for (const auto* f : inlined) {
+        const auto* sub_d = f->message_type();
+        bool any = false;
+        for (int i = 0; i < sub_d->field_count() && !any; ++i) any = v.HasMember(JsonName(sub_d, sub_d->field(i)));
+        if (any) Fill(*r->MutableMessage(&m, f), v);
+    }
+}
+
 // The message of a kind: the API group's package, or meta, or the
 // apiextensions types that live in their own repository.
 std::vector<std::string> Candidates(const std::string& api_version, const std::string& kind) {
@@ -272,6 +520,45 @@ json::Value Decoder::Decode(const std::string& body) const {
         return b.ExtractValue();
     }
     throw ApiError(415, "UnsupportedMediaType", "no protobuf schema for " + api_version + " " + kind);
+}
+
+std::optional<std::string> Decoder::Encode(const json::Value& object) const {
+    const auto api_version = object["apiVersion"].As<std::string>("");
+    const auto kind = object["kind"].As<std::string>("");
+    if (kind.empty()) return std::nullopt;
+    const pb::Descriptor* desc = nullptr;
+    for (const auto& candidate : Candidates(api_version, kind)) {
+        if ((desc = impl_->importer.pool()->FindMessageTypeByName(candidate))) break;
+    }
+    const auto* unknown_desc = impl_->importer.pool()->FindMessageTypeByName("k8s.io.apimachinery.pkg.runtime.Unknown");
+    if (!desc || !unknown_desc) return std::nullopt;
+    std::unique_ptr<pb::Message> msg(impl_->factory.GetPrototype(desc)->New());
+    Fill(*msg, object);
+    std::unique_ptr<pb::Message> unknown(impl_->factory.GetPrototype(unknown_desc)->New());
+    const auto* ur = unknown->GetReflection();
+    auto* type_meta = ur->MutableMessage(unknown.get(), unknown_desc->FindFieldByName("typeMeta"));
+    const auto* td = type_meta->GetDescriptor();
+    type_meta->GetReflection()->SetString(type_meta, td->FindFieldByName("apiVersion"), api_version);
+    type_meta->GetReflection()->SetString(type_meta, td->FindFieldByName("kind"), kind);
+    ur->SetString(unknown.get(), unknown_desc->FindFieldByName("raw"), msg->SerializeAsString());
+    ur->SetString(unknown.get(), unknown_desc->FindFieldByName("contentEncoding"), "");
+    ur->SetString(unknown.get(), unknown_desc->FindFieldByName("contentType"), "");
+    return std::string("k8s\0", 4) + unknown->SerializeAsString();
+}
+
+std::optional<std::string> Decoder::EncodeWatchEvent(const std::string& type, const json::Value& object) const {
+    auto inner = Encode(object);
+    const auto* desc = impl_->importer.pool()->FindMessageTypeByName("k8s.io.apimachinery.pkg.apis.meta.v1.WatchEvent");
+    if (!inner || !desc) return std::nullopt;
+    std::unique_ptr<pb::Message> event(impl_->factory.GetPrototype(desc)->New());
+    const auto* r = event->GetReflection();
+    r->SetString(event.get(), desc->FindFieldByName("type"), type);
+    auto* raw = r->MutableMessage(event.get(), desc->FindFieldByName("object"));
+    raw->GetReflection()->SetString(raw, raw->GetDescriptor()->FindFieldByName("raw"), *inner);
+    auto body = event->SerializeAsString();
+    const auto n = static_cast<std::uint32_t>(body.size());
+    std::string frame{static_cast<char>(n >> 24), static_cast<char>(n >> 16), static_cast<char>(n >> 8), static_cast<char>(n)};
+    return frame + body;
 }
 
 const Decoder* Decoder::Instance() { return g_instance.load(); }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <userver/formats/json/value.hpp>
@@ -21,6 +22,14 @@ public:
 
     // Throws ApiError when the body is not a known object.
     userver::formats::json::Value Decode(const std::string& body) const;
+
+    // The other way: an object (its apiVersion and kind say which) as the
+    // protobuf body upstream would send, "k8s\0" and a runtime.Unknown.
+    // nullopt for objects with no protobuf type, custom resources say.
+    std::optional<std::string> Encode(const userver::formats::json::Value& object) const;
+    // One frame of a protobuf watch stream: its length, then a WatchEvent
+    // whose object is encoded as above.
+    std::optional<std::string> EncodeWatchEvent(const std::string& type, const userver::formats::json::Value& object) const;
 
     // The decoder of the server, once one is set up; nullptr before.
     static const Decoder* Instance();

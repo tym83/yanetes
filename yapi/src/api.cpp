@@ -571,18 +571,50 @@ bool Api::IsStreamed(const http::HttpRequest& request, userver::server::request:
     return Flag(request, "watch");
 }
 
+// Whether the client wants protobuf: its first choice is plain
+// application/vnd.kubernetes.protobuf, as client-go's typed clients send.
+// Anything with parameters (tables, partial metadata) stays JSON, which
+// those clients list next.
+bool WantsProtobuf(const http::HttpRequest& request) {
+    auto accept = request.GetHeader("Accept");
+    accept = accept.substr(0, accept.find(','));
+    while (!accept.empty() && accept.back() == ' ') accept.pop_back();
+    while (!accept.empty() && accept.front() == ' ') accept.erase(0, 1);
+    return accept == "application/vnd.kubernetes.protobuf";
+}
+
+// A JSON answer turned into protobuf when the client asked for it and the
+// object has a protobuf type; JSON otherwise, which the client accepts too.
+std::string AsRequested(const http::HttpRequest& request, std::string body) {
+    if (!WantsProtobuf(request)) return body;
+    auto& response = request.GetHttpResponse();
+    const auto* decoder = proto::Decoder::Instance();
+    if (!decoder || response.GetHeader(userver::http::headers::kContentType) != "application/json" || body.empty() || body[0] != '{') {
+        return body;
+    }
+    try {
+        auto encoded = decoder->Encode(json::FromString(body));
+        if (!encoded) return body;
+        response.SetHeader(std::string("Content-Type"), std::string("application/vnd.kubernetes.protobuf"));
+        return std::move(*encoded);
+    } catch (const std::exception& e) {
+        LOG_WARNING() << "answered in JSON, protobuf failed: " << e.what();
+        return body;
+    }
+}
+
 std::string Api::HandleRequestThrow(const http::HttpRequest& request, userver::server::request::RequestContext&) const {
     auto& response = request.GetHttpResponse();
     response.SetContentType("application/json");
     try {
-        return Handle(request);
+        return AsRequested(request, Handle(request));
     } catch (const ApiError& e) {
         response.SetStatus(static_cast<http::HttpStatus>(e.Code()));
-        return json::ToString(e.ToStatus());
+        return AsRequested(request, json::ToString(e.ToStatus()));
     } catch (const std::exception& e) {
         LOG_ERROR() << request.GetMethodStr() << " " << request.GetUrl() << ": " << e.what();
         response.SetStatus(http::HttpStatus::kInternalServerError);
-        return json::ToString(ApiError(500, "InternalError", e.what()).ToStatus());
+        return AsRequested(request, json::ToString(ApiError(500, "InternalError", e.what()).ToStatus()));
     }
 }
 
@@ -875,7 +907,18 @@ std::string Api::HandleInner(const http::HttpRequest& request) const {
                 ValueBuilder out(json::Type::kArray);
                 for (const auto& item : items) out.PushBack(metadata ? tables::Metadata(item) : ToView(r, item));
                 list["items"] = out;
-                return json::ToString(list.ExtractValue());
+                auto value = list.ExtractValue();
+                // Typed clients get the list in protobuf straight from the
+                // objects, not through a JSON text read back.
+                if (!metadata && !r.custom && WantsProtobuf(request)) {
+                    if (const auto* encoder = proto::Decoder::Instance()) {
+                        if (auto encoded = encoder->Encode(value)) {
+                            request.GetHttpResponse().SetHeader(std::string("Content-Type"), std::string("application/vnd.kubernetes.protobuf"));
+                            return std::move(*encoded);
+                        }
+                    }
+                }
+                return json::ToString(value);
             };
             std::vector<Value> found;
             if (!r.namespaced && !fields.Pinned("metadata.name").empty() && limit == 0) {
@@ -2024,15 +2067,22 @@ void Api::HandleStreamRequest(
             }
             sub = watch_.Subscribe(r, after);
         }
+        const bool table = tables::Wanted(request.GetHeader("Accept"));
+        const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
+        // Typed clients watch in protobuf: length-prefixed WatchEvents.
+        const auto* encoder = proto::Decoder::Instance();
+        const bool protobuf = encoder && !table && !metadata && !r.custom && WantsProtobuf(request);
+        if (protobuf) {
+            stream.SetHeader(std::string("Content-Type"), std::string("application/vnd.kubernetes.protobuf;stream=watch"));
+        }
         stream.SetStatusCode(200);
         stream.SetEndOfHeaders();
         // The headers leave with the first piece of body. A watch with
         // nothing to say yet must still answer, or the client waits in
         // Watch() for a change it has not made yet: a newline, which the
-        // JSON stream decoder skips.
-        stream.PushBodyChunk("\n", deadline);
-        const bool table = tables::Wanted(request.GetHeader("Accept"));
-        const bool metadata = !table && tables::MetadataWanted(request.GetHeader("Accept"));
+        // JSON stream decoder skips; an empty piece for protobuf, whose
+        // frames a stray byte would break.
+        stream.PushBodyChunk(protobuf ? std::string() : std::string("\n"), deadline);
         const auto include_object = Arg(request, "includeObject");
         bool columns_sent = false;
         auto send = [&](const Value& raw) {
@@ -2054,6 +2104,12 @@ void Api::HandleStreamRequest(
                 columns_sent = true;
                 stream.PushBodyChunk(json::ToString(b.ExtractValue()) + "\n", deadline);
                 return;
+            }
+            if (protobuf) {
+                if (auto frame = encoder->EncodeWatchEvent(event["type"].As<std::string>(""), event["object"])) {
+                    stream.PushBodyChunk(std::move(*frame), deadline);
+                    return;
+                }
             }
             stream.PushBodyChunk(json::ToString(event) + "\n", deadline);
         };
