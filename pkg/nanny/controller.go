@@ -1,4 +1,4 @@
-// Package nanny holds the controllers of Yandexnetes: what upstream's
+// Package nanny holds the controllers of Яnetes: what upstream's
 // kube-controller-manager does, written again against yapi.
 package nanny
 

@@ -7,8 +7,7 @@ and the code disagree, the code wins and this file is stale.
 
 ## 1. What this is
 
-**Яnetes** (ASCII `yanetes`; the working directory and Go module are still
-called `yandexnetes`, see §9) is "Kubernetes without Kubernetes": a
+**Яnetes** (ASCII `yanetes`, Go module `github.com/tym83/yanetes`) is "Kubernetes without Kubernetes": a
 Kubernetes whose thinking parts are written from scratch on Yandex's open
 source stack, while the node side is upstream.
 
@@ -115,7 +114,7 @@ Everything heavy runs in a tenant of the "workshop" Cozystack cluster
 on a laptop.
 
 - Admin kubeconfig: `~/workshop.txt`, context `admin@workshop`, namespace
-  `tenant-yandexnetes`. `hack/dev/k.sh` wraps that kubectl.
+  `tenant-yanetes`. `hack/dev/k.sh` wraps that kubectl.
 - Tenant manifest `hack/workshop/tenant.yaml` (quota 100 CPU / 128 GiB).
 - Pod **builder** (`hack/workshop/builder.yaml`): container `cxx`
   (userver image, builds yapi) and `go` (builds Go, runs e2e and KWOK).
@@ -130,13 +129,19 @@ on a laptop.
   `/ydb_data/cluster/kikimr_configs/config.yaml` (§7).
 - VMs (KubeVirt via Cozystack `VMInstance`, Ubuntu 24.04, 4 vCPU / 8 GiB):
   - **yx-1**: control plane (yapi, nanny, yplanner as systemd units from
-    `/opt/yandexnetes/current`), also a node with taint
+    `/opt/yanetes/current`), also a node with taint
     `node-role.kubernetes.io/control-plane:NoSchedule`.
   - **yx-2**, **yx-3**: workers (`hack/workshop/node.sh NAME`).
   - **yx-bench**: upstream kube-apiserver/controller-manager/scheduler for
     comparisons (`hack/bench/upstream.sh`), with pod **etcd**
     (`hack/bench/etcd.yaml`, same limits and volume as ydb).
-- SSH into a VM: `virtctl --context admin@workshop -n tenant-yandexnetes ssh ubuntu@vmi/vm-instance-yx-1` (with `KUBECONFIG=~/workshop.txt`).
+- SSH into a VM: `virtctl --context admin@workshop -n tenant-yanetes ssh ubuntu@vmi/vm-instance-yx-1` (with `KUBECONFIG=~/workshop.txt`).
+- The stand running on 2026-11-01 predates the rename: its namespace is
+  `tenant-yandexnetes` and its VMs keep `/opt/yandexnetes` and
+  `/etc/yandexnetes`. Pass `NS=tenant-yandexnetes` to the scripts to reach
+  it. `control-plane.sh` and `node.sh` lay out the new `/opt/yanetes` and
+  `/etc/yanetes` from scratch (certificates come from the builder), so a
+  full install moves a VM over; the old directories can then go.
 
 ## 4. Build, deploy, test
 
@@ -252,15 +257,14 @@ volume), same KWOK, 30 001 nodes:
 
 ## 9. Rules of the house
 
-- Name: **Яnetes** (Cyrillic Я + "netes"), ASCII `yanetes`. Rename the
-  repository, module path and docs at publication; until then
-  `yandexnetes` everywhere. No Yandex logos or branding; the README says
+- Name: **Яnetes** (Cyrillic Я + "netes"), ASCII `yanetes` wherever
+  only ASCII goes (module path, paths, namespaces). No Yandex logos or branding; the README says
   it is not affiliated with Yandex LLC and is satire. Reason: trademark
   risk.
 - Languages: code, comments, commits, PRs, documentation in **English**
   (documentation also gets a `.ru.md` copy); the article in **Russian**.
-- Git: work on a feature branch (currently `feat/skeleton`, not pushed),
-  never on main. Every commit `--signoff` and exactly one trailer
+- Git: public repository github.com/tym83/yanetes; work on feature
+  branches, never on main. Every commit `--signoff` and exactly one trailer
   `Assisted-by: LLM`; no other AI attribution anywhere (no
   Co-Authored-By, no "generated with" in code, docs or PRs). Semantic
   commit messages that say why, not what. The repo will be the owner's

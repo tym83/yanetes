@@ -1,4 +1,4 @@
-# yapi: the API server of Yandexnetes.
+# yapi: the API server of Яnetes.
 components_manager:
     task_processors:
         main-task-processor:

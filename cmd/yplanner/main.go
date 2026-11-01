@@ -1,4 +1,4 @@
-// yplanner places the pods of Yandexnetes on nodes.
+// yplanner places the pods of Яnetes on nodes.
 package main
 
 import (
@@ -13,7 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/tym83/yandexnetes/pkg/yplanner"
+	"github.com/tym83/yanetes/pkg/yplanner"
 )
 
 func main() {

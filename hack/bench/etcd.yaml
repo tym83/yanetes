@@ -4,7 +4,7 @@ apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: etcd
-  namespace: tenant-yandexnetes
+  namespace: tenant-yanetes
 spec:
   accessModes: [ReadWriteOnce]
   storageClassName: replicated
@@ -16,7 +16,7 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: etcd
-  namespace: tenant-yandexnetes
+  namespace: tenant-yanetes
   labels:
     app: etcd
 spec:
@@ -29,7 +29,7 @@ spec:
     - --name=etcd
     - --data-dir=/var/lib/etcd
     - --listen-client-urls=http://0.0.0.0:2379
-    - --advertise-client-urls=http://etcd.tenant-yandexnetes.svc:2379
+    - --advertise-client-urls=http://etcd.tenant-yanetes.svc:2379
     - --quota-backend-bytes=8589934592
     - --auto-compaction-retention=1
     ports:
@@ -48,7 +48,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: etcd
-  namespace: tenant-yandexnetes
+  namespace: tenant-yanetes
 spec:
   selector: {app: etcd}
   ports:

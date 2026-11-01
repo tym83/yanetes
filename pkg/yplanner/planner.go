@@ -1,4 +1,4 @@
-// Package yplanner is the scheduler of Yandexnetes: it finds a node for
+// Package yplanner is the scheduler of Яnetes: it finds a node for
 // every pod nobody placed yet and binds the pod there.
 package yplanner
 

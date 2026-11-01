@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Starts a Yandexnetes worker as a VM in the tenant:
+# Starts a Яnetes worker as a VM in the tenant:
 #
 #   hack/workshop/node.sh <name>
 #
@@ -9,7 +9,7 @@
 set -euo pipefail
 
 NAME=${1:?node name required}
-NS=${NS:-tenant-yandexnetes}
+NS=${NS:-tenant-yanetes}
 DIR=$(cd "$(dirname "$0")" && pwd)
 K=(kubectl --kubeconfig "${KUBECONFIG_WORKSHOP:-$HOME/workshop.txt}" --context "${KUBE_CONTEXT:-admin@workshop}" -n "$NS")
 b() { "${K[@]}" exec builder -c cxx -- sh -c "$1"; }

@@ -1,4 +1,4 @@
-module github.com/tym83/yandexnetes
+module github.com/tym83/yanetes
 
 go 1.26.0
 

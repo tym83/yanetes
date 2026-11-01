@@ -7,7 +7,7 @@
 #   hack/bench/upstream.sh [vm-name]
 set -euo pipefail
 NODE=${1:-yx-bench}
-NS=${NS:-tenant-yandexnetes}
+NS=${NS:-tenant-yanetes}
 K=(kubectl --kubeconfig "${KUBECONFIG_WORKSHOP:-$HOME/workshop.txt}" --context "${KUBE_CONTEXT:-admin@workshop}" -n "$NS")
 b() { "${K[@]}" exec -i builder -c cxx -- sh -c "$1"; }
 vm() {

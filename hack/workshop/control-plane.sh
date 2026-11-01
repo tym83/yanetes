@@ -15,7 +15,7 @@ set -euo pipefail
 
 NODE=${1:?node name required}
 MODE=${2:-install}
-NS=${NS:-tenant-yandexnetes}
+NS=${NS:-tenant-yanetes}
 K=(kubectl --kubeconfig "${KUBECONFIG_WORKSHOP:-$HOME/workshop.txt}" --context "${KUBE_CONTEXT:-admin@workshop}" -n "$NS")
 b() { "${K[@]}" exec -i builder -c "$1" -- sh -c "$2"; }
 vm() {
@@ -45,10 +45,10 @@ BUILDER=$("${K[@]}" get pod builder -o jsonpath='{.status.podIP}')
 b cxx "set -e; mkdir -p /work/out/www; tar -C /work/out/cp -czf /work/out/www/cp-$REL.tgz .
   curl -fs -o /dev/null http://127.0.0.1:8099/ || (setsid nohup python3 -m http.server 8099 --directory /work/out/www >/dev/null 2>&1 < /dev/null &)
   sleep 1"
-vm "$NODE" "set -e; sudo mkdir -p /opt/yandexnetes/releases/$REL
-  curl -fsS http://$BUILDER:8099/cp-$REL.tgz | sudo tar -xzf - -C /opt/yandexnetes/releases/$REL
-  sudo test -x /opt/yandexnetes/releases/$REL/bin/yapi
-  sudo ln -sfn /opt/yandexnetes/releases/$REL /opt/yandexnetes/current.new && sudo mv -T /opt/yandexnetes/current.new /opt/yandexnetes/current"
+vm "$NODE" "set -e; sudo mkdir -p /opt/yanetes/releases/$REL
+  curl -fsS http://$BUILDER:8099/cp-$REL.tgz | sudo tar -xzf - -C /opt/yanetes/releases/$REL
+  sudo test -x /opt/yanetes/releases/$REL/bin/yapi
+  sudo ln -sfn /opt/yanetes/releases/$REL /opt/yanetes/current.new && sudo mv -T /opt/yanetes/current.new /opt/yanetes/current"
 
 if [ "$MODE" != restart ]; then
   # A serving certificate that names the node too, from the same CA.
@@ -75,35 +75,35 @@ C
     openssl x509 -req -in front-proxy-client.csr -CA front-proxy-ca.crt -CAkey front-proxy-ca.key -CAcreateserial -days 825 \
       -extfile front-proxy.cnf -extensions ext -out front-proxy-client.crt 2>/dev/null"
   b cxx "tar -C /work/run -czf - pki/ca.crt pki/tls.key pki/tls-chain.crt pki/sa.key pki/front-proxy-ca.crt pki/front-proxy-client.crt pki/front-proxy-client.key tokens.csv admin.conf" |
-    vm "$NODE" "sudo mkdir -p /etc/yandexnetes/cp && sudo tar -xzf - -C /etc/yandexnetes/cp && sudo chmod -R go-rwx /etc/yandexnetes/cp"
-  vm "$NODE" "sudo tee /etc/yandexnetes/cp/config_vars.yaml >/dev/null <<EOF
+    vm "$NODE" "sudo mkdir -p /etc/yanetes/cp && sudo tar -xzf - -C /etc/yanetes/cp && sudo chmod -R go-rwx /etc/yanetes/cp"
+  vm "$NODE" "sudo tee /etc/yanetes/cp/config_vars.yaml >/dev/null <<EOF
 port: 6443
-tls-cert: /etc/yandexnetes/cp/pki/tls-chain.crt
-tls-key: /etc/yandexnetes/cp/pki/tls.key
-tokens-file: /etc/yandexnetes/cp/tokens.csv
-openapi-dir: /opt/yandexnetes/current/openapi
-proto-dir: /opt/yandexnetes/current/proto
-rbac-dir: /opt/yandexnetes/current/rbac
+tls-cert: /etc/yanetes/cp/pki/tls-chain.crt
+tls-key: /etc/yanetes/cp/pki/tls.key
+tokens-file: /etc/yanetes/cp/tokens.csv
+openapi-dir: /opt/yanetes/current/openapi
+proto-dir: /opt/yanetes/current/proto
+rbac-dir: /opt/yanetes/current/rbac
 ydb-endpoint: ydb.$NS.svc.cozy.local:2136
 ydb-database: /local
 worker-threads: 4
 log-level: warning
-service-account-key-file: /etc/yandexnetes/cp/pki/sa.key
+service-account-key-file: /etc/yanetes/cp/pki/sa.key
 advertise-address: $IP
 service-cidr: 10.112.0.0/16
-client-ca-file: /etc/yandexnetes/cp/pki/ca.crt
-requestheader-client-ca-file: /etc/yandexnetes/cp/pki/front-proxy-ca.crt
-proxy-client-cert-file: /etc/yandexnetes/cp/pki/front-proxy-client.crt
-proxy-client-key-file: /etc/yandexnetes/cp/pki/front-proxy-client.key
+client-ca-file: /etc/yanetes/cp/pki/ca.crt
+requestheader-client-ca-file: /etc/yanetes/cp/pki/front-proxy-ca.crt
+proxy-client-cert-file: /etc/yanetes/cp/pki/front-proxy-client.crt
+proxy-client-key-file: /etc/yanetes/cp/pki/front-proxy-client.key
 EOF
-sudo sed -E 's#server: \"?https://[^\",} ]*\"?#server: \"https://127.0.0.1:6443\"#' /etc/yandexnetes/cp/admin.conf | sudo tee /etc/yandexnetes/cp/local.conf >/dev/null
+sudo sed -E 's#server: \"?https://[^\",} ]*\"?#server: \"https://127.0.0.1:6443\"#' /etc/yanetes/cp/admin.conf | sudo tee /etc/yanetes/cp/local.conf >/dev/null
 unit() { sudo tee /etc/systemd/system/\$1.service >/dev/null; }
 unit yapi <<EOF
 [Unit]
 After=network-online.target
 [Service]
-Environment=LD_LIBRARY_PATH=/opt/yandexnetes/current/lib
-ExecStart=/opt/yandexnetes/current/bin/yapi --config /opt/yandexnetes/current/etc/static_config.yaml --config_vars /etc/yandexnetes/cp/config_vars.yaml
+Environment=LD_LIBRARY_PATH=/opt/yanetes/current/lib
+ExecStart=/opt/yanetes/current/bin/yapi --config /opt/yanetes/current/etc/static_config.yaml --config_vars /etc/yanetes/cp/config_vars.yaml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -114,7 +114,7 @@ unit nanny <<EOF
 [Unit]
 After=yapi.service
 [Service]
-ExecStart=/opt/yandexnetes/current/bin/nanny --kubeconfig /etc/yandexnetes/cp/local.conf --root-ca-file /etc/yandexnetes/cp/pki/ca.crt
+ExecStart=/opt/yanetes/current/bin/nanny --kubeconfig /etc/yanetes/cp/local.conf --root-ca-file /etc/yanetes/cp/pki/ca.crt
 Restart=always
 RestartSec=3
 [Install]
@@ -124,7 +124,7 @@ unit yplanner <<EOF
 [Unit]
 After=yapi.service
 [Service]
-ExecStart=/opt/yandexnetes/current/bin/yplanner --kubeconfig /etc/yandexnetes/cp/local.conf
+ExecStart=/opt/yanetes/current/bin/yplanner --kubeconfig /etc/yanetes/cp/local.conf
 Restart=always
 RestartSec=3
 [Install]
@@ -140,7 +140,7 @@ sudo systemctl daemon-reload"
   # Kubelets, kube-proxies and flannels, and the builder's own kubeconfig, follow.
   for vmi in $("${K[@]}" get vmi -o jsonpath='{.items[*].metadata.name}'); do
     n=${vmi#vm-instance-}
-    vm "$n" "sudo sed -i 's|server: \"https://[^\"]*\"|server: \"$API\"|' /etc/yandexnetes/kubelet.conf /etc/yandexnetes/kube-proxy.conf && sudo systemctl restart kubelet kube-proxy flanneld"
+    vm "$n" "sudo sed -i 's|server: \"https://[^\"]*\"|server: \"$API\"|' /etc/yanetes/kubelet.conf /etc/yanetes/kube-proxy.conf && sudo systemctl restart kubelet kube-proxy flanneld"
   done
   b cxx "sed -i -E 's#server: \"?https://[^\",} ]*\"?#server: \"$API\"#' /work/run/admin.conf"
 else

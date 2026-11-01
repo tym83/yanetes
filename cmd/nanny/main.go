@@ -1,4 +1,4 @@
-// nanny runs the controllers of Yandexnetes against yapi.
+// nanny runs the controllers of Яnetes against yapi.
 package main
 
 import (
@@ -15,7 +15,7 @@ import (
 	"k8s.io/client-go/metadata"
 	"k8s.io/client-go/tools/clientcmd"
 
-	"github.com/tym83/yandexnetes/pkg/nanny"
+	"github.com/tym83/yanetes/pkg/nanny"
 )
 
 func main() {

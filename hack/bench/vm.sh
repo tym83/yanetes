@@ -4,7 +4,7 @@
 # kube-apiserver, kube-controller-manager and kube-scheduler on it.
 set -euo pipefail
 NAME=${1:-yx-bench}
-NS=${NS:-tenant-yandexnetes}
+NS=${NS:-tenant-yanetes}
 K=(kubectl --kubeconfig "${KUBECONFIG_WORKSHOP:-$HOME/workshop.txt}" --context "${KUBE_CONTEXT:-admin@workshop}" -n "$NS")
 SSH_KEY=$(cat "${SSH_KEY_FILE:-$HOME/.ssh/id_ed25519.pub}")
 "${K[@]}" apply -f - <<YAML
