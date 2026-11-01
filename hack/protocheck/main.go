@@ -113,7 +113,8 @@ func main() {
 	// A protobuf watch sees a change made through JSON, decoded the same.
 	ns := fmt.Sprintf("protocheck-%d", time.Now().Unix())
 	_, _ = j.CoreV1().Namespaces().Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: ns}}, metav1.CreateOptions{})
-	w, err := p.CoreV1().ConfigMaps(ns).Watch(ctx, metav1.ListOptions{})
+	// Only ours: the namespace gets its kube-root-ca.crt meanwhile.
+	w, err := p.CoreV1().ConfigMaps(ns).Watch(ctx, metav1.ListOptions{LabelSelector: "a=b"})
 	if err != nil {
 		panic(err)
 	}
