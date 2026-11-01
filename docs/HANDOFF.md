@@ -75,8 +75,12 @@ One userver service. Components (`yapi/src/main.cpp` registers them):
   front-proxy client certificate, discovery of remote groups, availability
   conditions; publishes `kube-system/extension-apiserver-authentication`.
 - `yapi-protobuf` (`proto.*`): decodes protobuf request bodies into JSON
-  using upstream `generated.proto` files and hints (`hack/protohints`).
-  **Responses are JSON only** — see §8.
+  and encodes answers back (objects, lists, Status, watch frames) when the
+  client asks for `application/vnd.kubernetes.protobuf` first, using
+  upstream `generated.proto` files and hints (`hack/protohints`). Encoded
+  objects are cached per uid, resourceVersion and type; lists are put
+  together from item bytes. `hack/protocheck KUBECONFIG` compares what a
+  JSON client and a protobuf client decode for ~30 types.
 - The HTTP handler `Api` (`api.*`, ~2.5k lines): routing, discovery
   (incl. aggregated v2), CRUD, patch (merge, JSON, strategic, server-side
   apply), watch, field validation, tables, proxy/exec/attach/port-forward/
@@ -195,10 +199,10 @@ volume), same KWOK, 30 001 nodes:
 | Register 30 001 nodes | 14.0 s, 2148/s, p99 365 ms | 5.9 s, 5054/s, p99 66 ms |
 | All nodes Ready | 78 s | 53 s |
 | Heartbeat age p99 (limit 40 s) | 32 s | 3 s |
-| Create 10 000 pods | 14.2 s, 703/s, p99 1.07 s | 7.7 s, 1294/s, p99 289 ms |
+| Create 10 000 pods | 14.2 s, 703/s, p99 1.07 s | 7.7 s, 1294/s, p99 289 ms (admission from cache) |
 | 10 000 pods to Running | 266 s | 69 s |
 | `GET nodes` JSON, 30 001 nodes | 1.5 s (106 MB, with managedFields) | 1.0 s (59 MB) |
-| List nodes+pods, client asks protobuf | 3.0 s | 4.0 s (we answer JSON) |
+| List nodes+pods, client asks protobuf | 3.0 s | 4.0 s before protobuf answers; to be re-measured |
 | `kubectl get nodes` (table) | 12.4 s | 11.0 s |
 | Steady CPU | ≈ 4.35 cores | ≈ 4.4 cores |
 
@@ -228,21 +232,19 @@ volume), same KWOK, 30 001 nodes:
 
 ## 8. What is next, in order
 
-1. **Protobuf responses** (in progress when this was written): encode
-   responses, lists and watch events as protobuf when the client asks
-   (`application/vnd.kubernetes.protobuf`), the reverse of
-   `proto::Decoder` using the same descriptors and hints, with the
-   `k8s\0` magic and `runtime.Unknown` wrapper; watch frames are
-   length-prefixed `metav1.WatchEvent`. Every built-in client defaults to
-   it. Then run full conformance again and re-measure (§6).
-2. Conformance re-run after the performance work (§5).
-3. Scale: give yx-1 16–32 vCPU (quota allows), aim at 100 000+ KWOK nodes.
-   Watch: watch cache memory, nanny CPU (node lifecycle at 1.7 cores with
-   30k nodes), serialization of big lists (cache serialized objects).
+1. **Conformance after the performance work and protobuf answers**: full
+   run r16 + s9 was started 2026-11-01 (`/work/e2e/full6.out`). Commits
+   after it (`4517a8d`, encoded-object cache) still need a run.
+2. **Re-measure** with `hack/bench/run.sh` against both servers (§6); the
+   upstream side is still installed on yx-bench, etcd pod still running.
+3. **Scale**: give yx-1 16–32 vCPU (tenant quota is 100 CPU), aim at
+   100 000+ KWOK nodes. Watch memory of the watch cache and the encoded
+   cache, nanny CPU (node lifecycle took 1.7 cores at 30k nodes).
 4. `managedFields` (server-side apply field ownership) — absent today.
 5. Rename to Яnetes / `yanetes` (§9), README (English) + `README.ru.md`,
    publish `github.com/tym83/yanetes`. Show the README to the owner before
-   publishing.
+   publishing. The repository has no remote yet: creating one needs the
+   owner (the agent's permission filter refused to upload).
 6. Satire overlays from `docs/design.ru.md` (selectively; not the "Plus"
    subscription — dropped by the owner).
 7. Article (Russian) for Habr with the numbers.
